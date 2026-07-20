@@ -1,0 +1,14 @@
+# Ruff configuration. See https://docs.astral.sh/ruff/
+target-version = "py39"
+line-length = 100
+
+[lint]
+# Pyflakes (F), pycodestyle errors/warnings (E, W), and import sorting (I).
+select = ["E", "F", "W", "I"]
+# The formatter owns code line length; E501 otherwise only flags string
+# literals (HTML templates, log formats) it can't wrap, which is just noise.
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# __init__.py modules intentionally re-export their public API.
+"__init__.py" = ["F401"]

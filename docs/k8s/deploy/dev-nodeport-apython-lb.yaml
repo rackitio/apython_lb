@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: apython-lb
+spec:
+  type: NodePort
+  selector:
+    app: apython-lb
+  ports:
+    - port: 443
+      targetPort: 443
+      nodePort: 30002
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apython-lb
+  namespace: default
+  labels:
+    app: apython-lb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apython-lb
+  template:
+    metadata:
+      labels:
+        app: apython-lb
+    spec:
+      containers:
+        - name: apython-lb
+          image: registry.example.com/apython_lb:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 443
+              protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - name: apython-lb-storage
+              mountPath: /app/data
+            - name: apython-lb-tls
+              mountPath: /app/cert.pem
+              subPath: cert.pem
+              readOnly: true
+            - name: apython-lb-tls
+              mountPath: /app/key.pem
+              subPath: key.pem
+              readOnly: true
+          env:
+            - name: SQLITE_DB
+              value: /app/data/apython_lb.db
+            - name: DNS_NAMESERVERS
+              value: "kube-dns.kube-system.svc.cluster.local"
+            - name: IP_TRACKER_404_THRESHOLD
+              value: "4"
+            - name: IP_TRACKER_WINDOW_SECONDS
+              value: "120"
+            - name: IP_TRACKER_PENALTY_DURATION
+              value: "300"
+            - name: HEALTH_CHECK_INTERVAL
+              value: "60"
+            - name: CONFIG_POLL_INTERVAL
+              value: "10"
+            - name: LB_MAX_ATTEMPTS
+              value: "3"
+            - name: LB_UPSTREAM_HTTP2
+              value: "true"
+            - name: LB_UPSTREAM_VERIFY_TLS
+              value: "true"
+            - name: LB_UPSTREAM_TIMEOUT_SECONDS
+              value: "30"
+            - name: MODSECURITY_ENABLED
+              value: "true"
+            - name: APP_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: secret-key
+      volumes:
+        - name: apython-lb-storage
+          persistentVolumeClaim:
+            claimName: apython-lb-pvc
+        - name: apython-lb-tls
+          secret:
+            secretName: apython-lb-tls
+            items:
+              - key: tls.crt
+                path: cert.pem
+              - key: tls.key
+                path: key.pem
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccountName: default
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      serviceAccount: default
+      serviceAccountName: default

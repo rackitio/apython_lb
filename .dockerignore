@@ -1,0 +1,16 @@
+*.md
+Dockerfile
+.git
+.gitignore
+.github
+.ruff_cache
+docs
+.pytest_cache
+.claude
+.githooks
+__pycache__
+certs
+data
+*.pem
+*.key
+.DS_Store

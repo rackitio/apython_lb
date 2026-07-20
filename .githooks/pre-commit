@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# Ruff pre-commit hook for apython_lb.
+# Lints and formats staged Python files, auto-applying fixes and re-staging
+# them. The commit is blocked only if lint errors remain that ruff can't fix.
+#
+# Requires ruff: `pip install ruff` (or it's found via `python3 -m ruff`).
+
+set -euo pipefail
+
+# Locate ruff: prefer one on PATH, fall back to the Python module.
+if command -v ruff >/dev/null 2>&1; then
+    RUFF=(ruff)
+elif python3 -m ruff --version >/dev/null 2>&1; then
+    RUFF=(python3 -m ruff)
+else
+    echo "pre-commit: ruff not found. Install it with 'pip install ruff'." >&2
+    exit 1
+fi
+
+# Collect staged Python files (Added/Copied/Modified/Renamed).
+# Read into an array with a loop so this works on bash 3.2 (macOS default).
+files=()
+while IFS= read -r f; do
+    files+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
+if [ ${#files[@]} -eq 0 ]; then
+    exit 0
+fi
+
+# Auto-fix lint issues and format, then re-stage anything ruff changed.
+"${RUFF[@]}" check --fix "${files[@]}"
+"${RUFF[@]}" format "${files[@]}"
+git add -- "${files[@]}"
+
+# Final gate: block the commit if unfixable lint issues remain.
+"${RUFF[@]}" check "${files[@]}"

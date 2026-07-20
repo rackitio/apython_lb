@@ -1,0 +1,12 @@
+hypercorn==0.18.0
+quart==0.20.0
+httpx==0.28.1
+aiosqlite==0.22.1
+aiodns==4.0.4
+prometheus-client==0.21.1
+
+# build and install steps
+# HTTPS: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+# Build: docker build -t apython_lb:latest .
+# Run: docker run -d --restart=on-failure:3 -p 443:443/tcp apython_lb:latest
+# Test req: curl -sk https://localhost/health
