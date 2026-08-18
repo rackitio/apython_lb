@@ -36,6 +36,20 @@ spec:
             - containerPort: 443
               protocol: TCP
           resources: {}
+          # /health only turns 200 once configured backends are verified
+          # healthy (see README's "Health checks" section), so this keeps
+          # the Service from routing to a pod before it's actually ready.
+          # Deliberately not a livenessProbe: an all-backends-down outage
+          # shouldn't trigger restart-loop churn on a pod that's otherwise
+          # fine.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 443
+              scheme: HTTPS
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
           volumeMounts:

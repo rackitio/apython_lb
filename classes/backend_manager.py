@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 HEALTH_CHECK_INTERVAL = int(os.environ.get("HEALTH_CHECK_INTERVAL", 60))  # seconds
 CONFIG_POLL_INTERVAL = int(os.environ.get("CONFIG_POLL_INTERVAL", 10))  # seconds
 
+# ── /health readiness tunables ─────────────────────────────────────────── #
+# Minimum number of configured backend pools that must each have at least one
+# verified-healthy server before /health reports ready. Unset (None) means
+# "all of them" — the strict default for rolling deploys. Set to a lower
+# number (0 short-circuits entirely) if you have many backends and want
+# traffic routed as soon as a subset comes up.
+_min_backends_env = os.environ.get("HEALTH_READY_MIN_BACKENDS")
+HEALTH_READY_MIN_BACKENDS = int(_min_backends_env) if _min_backends_env else None
+
+# Comma-separated backend names that, if set, are the ONLY backends /health
+# waits on — a short circuit for rollouts where one canary backend proves the
+# new container is wired up correctly and the rest can catch up async.
+HEALTH_READY_BACKENDS = frozenset(
+    name.strip() for name in os.environ.get("HEALTH_READY_BACKENDS", "").split(",") if name.strip()
+)
+
 
 class BackendManager:
     def __init__(
@@ -26,10 +42,14 @@ class BackendManager:
         db: AsyncDb,
         health_check_interval: int = HEALTH_CHECK_INTERVAL,
         config_poll_interval: int = CONFIG_POLL_INTERVAL,
+        ready_min_backends: int | None = HEALTH_READY_MIN_BACKENDS,
+        ready_backends: frozenset[str] = HEALTH_READY_BACKENDS,
     ):
         self.db = db
         self.health_check_interval = health_check_interval
         self.config_poll_interval = config_poll_interval
+        self.ready_min_backends = ready_min_backends
+        self.ready_backends = ready_backends
 
         # Health checks use the same TLS policy as proxied traffic — a
         # backend that fails verification should not be marked healthy.
@@ -52,6 +72,41 @@ class BackendManager:
 
     def get_healthy_backends(self, name: str) -> StickyRoundRobin | None:
         return self._backends.get(name)
+
+    def readiness(self) -> tuple[bool, int, int]:
+        """
+        Compute /health readiness.
+
+        Returns (ready, healthy_backend_count, configured_backend_count).
+
+        - No backends configured yet (fresh install): ready — there's
+          nothing to be unhealthy.
+        - `ready_backends` set: ready once every named backend has at least
+          one verified-healthy server, ignoring all others.
+        - Otherwise: ready once at least `ready_min_backends` configured
+          backends (default: all of them) each have at least one
+          verified-healthy server.
+
+        A backend only counts once the background health-check loop has
+        actually probed it and found >=1 healthy server — being configured
+        is not enough.
+        """
+        total = len(self._configs)
+        if total == 0:
+            return True, 0, 0
+
+        healthy_names = {name for name, servers in self._last_healthy.items() if servers}
+
+        if self.ready_backends:
+            ready = self.ready_backends.issubset(healthy_names)
+            return ready, len(healthy_names & self.ready_backends), len(self.ready_backends)
+
+        # Clamp so a tunable larger than the configured backend count can't
+        # make /health permanently unready.
+        min_backends = (
+            total if self.ready_min_backends is None else min(self.ready_min_backends, total)
+        )
+        return len(healthy_names) >= min_backends, len(healthy_names), total
 
     def get_sticky_ip(self) -> StickyIP:
         return self._sticky_ip
@@ -198,6 +253,14 @@ class BackendManager:
 
     async def start(self):
         """Start both background loops as concurrent tasks."""
+        # Populate configs before the loops start racing each other.
+        # Without this, _health_check_loop's first pass can see an empty
+        # self._configs (its task gets scheduled before _poll_configs_once()
+        # finishes its first DB read) and then sleep for a full
+        # health_check_interval before checking anything — on a fresh
+        # container with pre-existing DB configs that stalls /health
+        # readiness for up to a minute for no reason.
+        await self._poll_configs_once()
         await asyncio.gather(
             self._poll_configs(),
             self._health_check_loop(),
