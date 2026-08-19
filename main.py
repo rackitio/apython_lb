@@ -120,7 +120,13 @@ def v1_proxy(path):
 
 @app.route("/health")
 async def health_check():
-    return {"status": "healthy"}, 200
+    ready, healthy, total = backend_manager.readiness()
+    body = {
+        "status": "healthy" if ready else "unhealthy",
+        "backends_ready": healthy,
+        "backends_total": total,
+    }
+    return body, 200 if ready else 503
 
 
 # Prometheus metrics leak operational detail (backend pool names, health

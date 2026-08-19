@@ -123,6 +123,8 @@ flowchart TD
 | `LB_UPSTREAM_TIMEOUT_SECONDS` | `30` | Per-request timeout (seconds) for forwarding to a backend |
 | `STICKY_SESSION_MAX_ENTRIES` | `10000` | Maximum tracked session→backend pins; oldest pins are evicted at capacity |
 | `STICKY_IP_MAX_ENTRIES` | `10000` | Maximum tracked IP→backend pins; oldest pins are evicted at capacity |
+| `HEALTH_READY_MIN_BACKENDS` | *(unset = all)* | Minimum number of configured backend pools that must each have at least one verified-healthy server before `/health` returns `200`. Unset requires all of them; `0` makes `/health` ready as soon as any backend is configured, regardless of health state — a short circuit for fast rollouts. Clamped to the configured backend count, so an over-large value can't make `/health` permanently unready. Ignored if `HEALTH_READY_BACKENDS` is set (see [Health checks](#health-checks)) |
+| `HEALTH_READY_BACKENDS` | *(unset)* | Comma-separated backend names that, if set, are the *only* ones `/health` waits on — point it at one canary backend during a rollout and let the rest catch up asynchronously. Overrides `HEALTH_READY_MIN_BACKENDS` |
 
 ## Health checks
 
@@ -134,6 +136,41 @@ lightweight 200 responder on `/`. The `hc_path` config field is accepted and
 stored but currently reserved — health checks always probe `/`. If your use
 case needs a configurable path or status set, fork and adapt; if it becomes a
 popular request we'll revisit with community input.
+
+### `/health`
+
+`/health` reports whether this container is actually ready to receive
+traffic — the intended use is a Kubernetes readiness/liveness probe or a
+Docker `HEALTHCHECK`, so a rolling deploy doesn't send requests to a
+container whose backend pools haven't been verified healthy yet:
+
+- **No backends configured** (fresh install, nothing rolled out yet):
+  `200`. There's nothing to be unhealthy.
+- **Backends configured:** `200` only once they've been verified healthy by
+  the background health-check loop — being configured is not enough, a
+  freshly-started container returns `503` until its first health-check pass
+  confirms at least one healthy server per backend (or per the
+  `HEALTH_READY_MIN_BACKENDS`/`HEALTH_READY_BACKENDS` tunables below).
+
+The response body reports counts (never backend names/IPs, to avoid leaking
+topology on a route that's typically not internal-only):
+
+```json
+{"status": "healthy", "backends_ready": 2, "backends_total": 2}
+```
+
+By default *every* configured backend pool must be healthy before `/health`
+goes green. Two tunables loosen that for rollouts where waiting on every
+backend isn't the right trade-off:
+
+- `HEALTH_READY_MIN_BACKENDS=<n>` — ready once at least `n` configured
+  backends are healthy, instead of all of them. `0` short-circuits
+  entirely: `/health` goes green as soon as any backend exists, without
+  waiting on health checks at all.
+- `HEALTH_READY_BACKENDS=<name>[,<name>...]` — ready once every *named*
+  backend is healthy, ignoring the rest. Useful when one backend is a
+  reliable signal that the container is correctly configured and the others
+  are slower to warm up.
 
 ## Deployment notes
 
