@@ -201,6 +201,18 @@ class ModSecurityEngine:
         if not self.enabled:
             return True, 200
 
+        # Rule 910001 (null byte in URI) can never fire via msc_process_uri():
+        # libmodsecurity's C API takes the URI as a plain null-terminated
+        # `const char *` with no length argument (unlike headers/body, which
+        # go through length-prefixed calls below and are inspected intact),
+        # so a URI containing \x00 gets silently truncated before
+        # ModSecurity ever sees the byte. Enforce it here instead — this is
+        # the one thing this engine cannot delegate to the C library.
+        if "\x00" in uri:
+            logger.debug(f"Null byte in URI, blocking without ModSecurity dispatch: {uri!r}")
+            WAF_INSPECTIONS_TOTAL.labels(action="blocked").inc()
+            return False, 400
+
         loop = asyncio.get_running_loop()
         allowed, status = await loop.run_in_executor(
             None,
