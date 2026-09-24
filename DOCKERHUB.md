@@ -37,7 +37,7 @@ mkdir -p certs
 openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem \
   -days 365 -nodes -subj "/CN=localhost"
 
-docker run --rm -p 8443:443 \
+docker run --rm -p 8443:443/tcp -p 8443:443/udp \
   -v "$PWD/certs/cert.pem":/app/cert.pem:ro \
   -v "$PWD/certs/key.pem":/app/key.pem:ro \
   <dockerhub-namespace>/apython_lb:latest
@@ -67,7 +67,7 @@ to a Quart route — see the source repo for route decorator examples
 
 | | |
 |---|---|
-| Port | `443` (TLS; there is no plain-HTTP listener) |
+| Port | `443/tcp` (HTTP/1.1 and HTTP/2 over TLS) and `443/udp` (HTTP/3 over QUIC) — there is no plain-HTTP listener |
 | `/app/cert.pem`, `/app/key.pem` | TLS certificate and key — required, container will not start without them |
 | `/app/data` | SQLite database (`apython_lb.db`) holding backend configs; mount a volume here to persist configs across restarts |
 
@@ -104,10 +104,16 @@ above.
 
 ## Image contents
 
-Base image: `python:3.14.2-slim`, plus `libmodsecurity-dev` for the WAF
-engine (loaded via `ctypes`, no compiler needed at runtime). The `test`
-build stage and its dependencies are stripped from the published image —
-this is a lean production image.
+Base image: `debian:trixie-slim` with free-threaded CPython 3.14.7
+(`--disable-gil` build, compiled from source — no official Python image
+ships a free-threaded variant yet), plus `libmodsecurity-dev` for the WAF
+engine (loaded via `ctypes`, no compiler needed at runtime). Served over
+HTTP/1.1, HTTP/2, and HTTP/3 via Hypercorn. `PYTHON_GIL=0` keeps
+free-threading on even though Hypercorn's HTTP/3 dependency (`aioquic`)
+hasn't declared itself GIL-safe — see the source repo's `Dockerfile` and
+README for why that's safe here. The `test` build stage and its
+dependencies are stripped from the published image — this is a lean
+production image.
 
 ## License & issues
 

@@ -52,6 +52,21 @@ async def test_engine_disabled_allows_all():
     assert status == 200
 
 
+@pytest.mark.asyncio
+async def test_engine_blocks_null_byte_in_uri_without_dispatching():
+    """Regression: msc_process_uri() takes the URI as a null-terminated
+    `const char *` with no length argument, so a \\x00 in the URI silently
+    truncates before ModSecurity ever sees it and rule 910001 never fires —
+    the untruncated string then reaches httpx downstream and blows up with
+    an unhandled 500 instead of a clean 400. Enforce it in Python instead,
+    before any C dispatch (self._lib is intentionally never touched here)."""
+    engine = ModSecurityEngine(enabled=False)
+    engine.enabled = True  # exercise the guard without a real libmodsecurity
+    allowed, status = await engine.inspect_request("1.2.3.4", "GET", "/test\x00.php", {}, b"")
+    assert not allowed
+    assert status == 400
+
+
 # ── modsec_waf decorator tests ────────────────────────────────────────── #
 
 
