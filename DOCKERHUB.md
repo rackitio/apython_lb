@@ -86,6 +86,8 @@ baked into the image.
 | `HEALTH_CHECK_INTERVAL` | `60` | Seconds between backend health checks |
 | `DNS_NAMESERVERS` | `1.1.1.1` | Comma-separated resolvers for backend hostname lookups |
 | `LB_MAX_ATTEMPTS` | `3` | Retries per request before giving up |
+| `HYPERCORN_WORKERS` | `1` | Worker **processes** sharing the bound ports (`SO_REUSEPORT`) — each is a fully independent process with its own state |
+| `HYPERCORN_WORKER_CLASS` | `asyncio` | `asyncio` or `uvloop`. Not `trio` — the app's SQLite layer requires asyncio's event loop, so trio isn't installed |
 
 The full variable reference (20+ options covering IP tracking, sticky
 pinning, TLS verification, and WAF tuning) is in the project README linked
@@ -108,10 +110,12 @@ Base image: `debian:trixie-slim` with free-threaded CPython 3.14.7
 (`--disable-gil` build, compiled from source — no official Python image
 ships a free-threaded variant yet), plus `libmodsecurity-dev` for the WAF
 engine (loaded via `ctypes`, no compiler needed at runtime). Served over
-HTTP/1.1, HTTP/2, and HTTP/3 via Hypercorn. `PYTHON_GIL=0` keeps
-free-threading on even though Hypercorn's HTTP/3 dependency (`aioquic`)
-hasn't declared itself GIL-safe — see the source repo's `Dockerfile` and
-README for why that's safe here. The `test` build stage and its
+HTTP/1.1, HTTP/2, and HTTP/3 via Hypercorn, optionally scaled with
+`HYPERCORN_WORKERS`/`HYPERCORN_WORKER_CLASS` (`uvloop` available alongside
+the `asyncio` default). `PYTHON_GIL=0` keeps free-threading on even though
+Hypercorn's HTTP/3 dependency (`aioquic`) hasn't declared itself GIL-safe —
+see the source repo's `Dockerfile` and README for why that's safe here,
+for both worker-class options. The `test` build stage and its
 dependencies are stripped from the published image — this is a lean
 production image.
 

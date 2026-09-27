@@ -145,6 +145,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV MODSECURITY_ENABLED=true
 ENV MODSECURITY_RULES_FILE=/app/modsecurity.conf
 
+# Read by hypercorn_config.py -- kept below the CPython compile step so
+# changing these doesn't bust that (expensive) build cache layer.
+ENV HYPERCORN_WORKERS=1
+ENV HYPERCORN_WORKER_CLASS=asyncio
+
 COPY requirements.txt requirements-dev.txt .
 
 # aioquic and pylsqpack (hypercorn's HTTP/3 stack) both hard-code Python's
@@ -255,18 +260,30 @@ RUN rm -rf /app/tests /app/requirements-dev.txt
 # --quic-bind is unconditional below. Forcing it off is safe for how this
 # image actually runs QUIC: neither aioquic extension locks its internal
 # per-instance C state (Buffer.pos, AEAD's OpenSSL contexts), so it's only
-# unsafe if the same instance is touched by two OS threads at once. Read
-# Hypercorn's own QUIC implementation (UDPServer/QuicProtocol in
-# hypercorn/asyncio/udp_server.py) to confirm it never does that: incoming
-# datagrams go through one asyncio.Queue, drained by a single coroutine on
-# one event-loop thread — no ThreadPoolExecutor or run_in_executor anywhere
-# in that path. --workers scales by spawning separate OS processes
-# (multiprocessing), not threads, so instances are never shared across
-# workers either. This holds only as long as that stays true — a future
-# Hypercorn or aioquic version, or a switch to a threaded deployment model,
-# could invalidate it silently. Neither project has audited or declared
-# itself free-threading-safe, so this is us reading their source and
-# accepting the risk, not an upstream guarantee.
+# unsafe if the same instance is touched by two OS threads at once. Verified
+# this holds for both worker_class options HYPERCORN_WORKER_CLASS can select
+# (hypercorn_config.py; trio is deliberately not offered — see the comment
+# there — so it isn't considered here):
+#   - asyncio: UDPServer/QuicProtocol (hypercorn/asyncio/udp_server.py) feed
+#     incoming datagrams through one asyncio.Queue, drained by a single
+#     coroutine on one event-loop thread -- no ThreadPoolExecutor or
+#     run_in_executor anywhere in that path.
+#   - uvloop: hypercorn's uvloop_worker reuses that exact same asyncio code
+#     path, just with a different (still single-threaded) loop underneath.
+#     uvloop itself also isn't a concern here regardless: it ships real
+#     cp314t wheels and doesn't trigger CPython's GIL-reenable at all
+#     (confirmed empirically -- pip install uvloop; python3 -c "import
+#     uvloop" leaves sys._is_gil_enabled() False).
+# --workers scales by spawning separate OS processes (multiprocessing,
+# "spawn" start method), not threads, so instances are never shared across
+# workers, and each process starts fresh with this same PYTHON_GIL=0.
+# Confirmed via /proc/<worker-pid>/environ, not just the CLI supervisor
+# process. This holds only as long as that stays true -- a future Hypercorn
+# or aioquic version, or a switch to a threaded deployment model, could
+# invalidate it silently. Neither aioquic nor uvloop has audited or
+# declared itself free-threading-safe via CPython's own mechanism for it,
+# so this is us reading their source (and, for uvloop, testing directly),
+# not an upstream guarantee.
 ENV PYTHON_GIL=0
 
 EXPOSE 443/tcp

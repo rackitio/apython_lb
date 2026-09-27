@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -15,11 +16,35 @@ class AsyncDb:
 
     async def initialize(self):
         if self.db is None:
-            self.db = await aiosqlite.connect(self.db_uri)
+            self.db = await aiosqlite.connect(self.db_uri, timeout=30)
             self.db.row_factory = aiosqlite.Row
-            await self.db.execute("PRAGMA journal_mode=WAL")
+            # With HYPERCORN_WORKERS > 1, every worker process opens this
+            # same file at startup and races to switch a brand-new database
+            # into WAL mode. That transition takes a brief exclusive lock
+            # that -- confirmed empirically, not just in theory -- doesn't
+            # honor the connection's busy_timeout above: a losing process
+            # gets "database is locked" immediately rather than waiting,
+            # which crashes that worker's whole lifespan startup. Retry it
+            # explicitly instead; once any worker finishes, the file is
+            # already in WAL mode and every other worker's PRAGMA is a fast
+            # no-op, so a handful of short retries is always enough.
+            await self._retry_locked(lambda: self.db.execute("PRAGMA journal_mode=WAL"))
             await self.db.execute("PRAGMA synchronous=NORMAL")
-            await self.init_db()
+            await self._retry_locked(self.init_db)
+
+    @staticmethod
+    async def _retry_locked(action, attempts: int = 10, delay: float = 0.3):
+        for attempt in range(attempts):
+            try:
+                await action()
+                return
+            except aiosqlite.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == attempts - 1:
+                    raise
+                logger.debug(
+                    f"Database locked during init (attempt {attempt + 1}/{attempts}), retrying"
+                )
+                await asyncio.sleep(delay)
 
     async def init_db(self):
         await self.db.execute("""

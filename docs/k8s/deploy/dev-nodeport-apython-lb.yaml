@@ -86,6 +86,10 @@ spec:
               value: "true"
             - name: LB_UPSTREAM_TIMEOUT_SECONDS
               value: "30"
+            - name: HYPERCORN_WORKERS
+              value: "1"
+            - name: HYPERCORN_WORKER_CLASS
+              value: "asyncio"
             - name: MODSECURITY_ENABLED
               value: "true"
             - name: APP_SECRET_KEY
