@@ -243,6 +243,30 @@ full reasoning, and revisit it if Hypercorn's or aioquic's internals change.
 The container listens on `443/tcp` (HTTP/1.1, HTTP/2) and `443/udp` (HTTP/3
 over QUIC), both using the same `/app/cert.pem` / `/app/key.pem`.
 
+### Workers and event loop
+
+Two env vars, read by `hypercorn_config.py` (CLI flags don't expand env vars
+in the Dockerfile's exec-form `CMD`, so this is where they're wired up):
+
+| Variable | Default | Description |
+|---|---|---|
+| `HYPERCORN_WORKERS` | `1` | Number of worker **processes** (`multiprocessing`, `spawn`) sharing the bound ports via `SO_REUSEPORT`. Each is a completely independent process — its own interpreter, its own in-memory IP-tracker/rate-limiter state, its own connection to `/app/data/apython_lb.db` |
+| `HYPERCORN_WORKER_CLASS` | `asyncio` | `asyncio` or `uvloop`. **Not** `trio`: `aiosqlite` calls `asyncio.get_event_loop()` internally, which doesn't exist under trio's runtime, so the app fails at startup regardless of GIL/free-threading — trio isn't installed and isn't offered as a choice |
+
+The `PYTHON_GIL=0` safety argument above was verified against both options:
+Hypercorn's `uvloop_worker` reuses the exact same single-threaded asyncio
+QUIC code path (just a different loop underneath), and `uvloop` itself
+ships real `cp314t` wheels and doesn't trigger CPython's GIL-reenable at
+all (confirmed empirically). See the Dockerfile comment for the full
+breakdown, including why trio was ruled out independent of any of this.
+
+`HYPERCORN_WORKERS > 1` surfaced a real startup race, also fixed here:
+every worker process opens `/app/data/apython_lb.db` and switches it into
+WAL mode concurrently, and that transition takes a brief exclusive lock
+that doesn't honor the connection's `busy_timeout` — a losing worker used
+to crash outright on `database is locked` instead of just waiting.
+`classes/sqlite_db.py` now retries that specific case with backoff.
+
 ## Running Locally
 Hypercorn serves TLS and expects `/app/cert.pem` and `/app/key.pem` inside the container. `*.pem` files are gitignored, so a fresh clone has none — without them every worker crashes at startup with `FileNotFoundError` from `create_ssl_context`. Generate a self-signed pair and mount it:
 

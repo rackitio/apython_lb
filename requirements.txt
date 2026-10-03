@@ -1,4 +1,4 @@
-hypercorn[h3]==0.18.0
+hypercorn[h3,uvloop]==0.18.0
 quart==0.23.1
 httpx==0.28.1
 aiosqlite==0.22.1
