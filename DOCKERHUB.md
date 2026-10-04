@@ -106,9 +106,10 @@ above.
 
 ## Image contents
 
-Base image: `debian:trixie-slim` with free-threaded CPython 3.14.7
-(`--disable-gil` build, compiled from source — no official Python image
-ships a free-threaded variant yet), plus `libmodsecurity-dev` for the WAF
+Base image: [`rackitio/pythont`](https://github.com/rackitio/pythont), a
+free-threaded CPython 3.14.7 (`--disable-gil`) build on `debian:trixie-slim`
+— no official Python image ships a free-threaded variant yet — plus
+`libmodsecurity-dev` for the WAF
 engine (loaded via `ctypes`, no compiler needed at runtime). Served over
 HTTP/1.1, HTTP/2, and HTTP/3 via Hypercorn, optionally scaled with
 `HYPERCORN_WORKERS`/`HYPERCORN_WORKER_CLASS` (`uvloop` available alongside

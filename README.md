@@ -229,16 +229,20 @@ the token. Client IPs are retained as core load-balancer operational data
 
 ## Docker image
 
-The image compiles a free-threaded (`--disable-gil`) build of CPython 3.14.7
-from source on `debian:trixie-slim` — no official Python image ships a
-free-threaded variant for any version yet, and Python 3.15 itself is still
-pre-release. `PYTHON_GIL=0` is set so the container stays free-threaded even
-though `aioquic` (Hypercorn's HTTP/3 dependency) hasn't declared itself
-GIL-safe and would otherwise make CPython silently fall back to the regular
-GIL the moment HTTP/3 starts. That override is safe specifically because of
-how Hypercorn runs QUIC (single event-loop thread, no thread pool in that
-path) — see the comment above `ENV PYTHON_GIL=0` in the `Dockerfile` for the
-full reasoning, and revisit it if Hypercorn's or aioquic's internals change.
+The image is based on [`rackitio/pythont`](https://github.com/rackitio/pythont),
+a free-threaded (`--disable-gil`) build of CPython compiled on
+`debian:trixie-slim` — no official Python image ships a free-threaded
+variant for any version yet. Splitting that build out means this project's
+own Dockerfile no longer carries the compile recipe, and `pythont` can be
+versioned/released independently; see that repo to bump the pinned Python
+version. `PYTHON_GIL=0` is set here so the container stays free-threaded
+even though `aioquic` (Hypercorn's HTTP/3 dependency) hasn't declared
+itself GIL-safe and would otherwise make CPython silently fall back to the
+regular GIL the moment HTTP/3 starts. That override is safe specifically
+because of how Hypercorn runs QUIC (single event-loop thread, no thread
+pool in that path) — see the comment above `ENV PYTHON_GIL=0` in the
+`Dockerfile` for the full reasoning, and revisit it if Hypercorn's or
+aioquic's internals change.
 
 The container listens on `443/tcp` (HTTP/1.1, HTTP/2) and `443/udp` (HTTP/3
 over QUIC), both using the same `/app/cert.pem` / `/app/key.pem`.

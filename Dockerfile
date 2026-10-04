@@ -1,6 +1,8 @@
-FROM debian:trixie-slim AS base
-
-ENV PATH=/usr/local/bin:$PATH
+# Free-threaded CPython 3.14.7, built by github.com/rackitio/pythont (see
+# that repo for why this isn't just FROM python:3.14-slim -- no official
+# Python image ships a free-threaded build -- and for how to bump the
+# version here once pythont publishes a new one).
+FROM rackitio/pythont:3.14.7 AS base
 
 ENV SQLITE_DB=/app/data/apython_lb.db
 ENV DNS_NAMESERVERS="1.1.1.1"
@@ -16,125 +18,10 @@ ENV LB_MAX_ATTEMPTS=3
 ENV LB_UPSTREAM_HTTP2=true
 ENV LB_UPSTREAM_VERIFY_TLS=true
 ENV LB_UPSTREAM_TIMEOUT_SECONDS=30
+ENV HYPERCORN_WORKERS=1
+ENV HYPERCORN_WORKER_CLASS=asyncio
 
 WORKDIR /app
-
-# Runtime deps for the Python build below — kept manually-marked so the
-# later apt-mark/purge dance (which drops build-only packages) doesn't
-# sweep these up.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    netbase \
-    tzdata \
-    && rm -rf /var/lib/apt/lists/*
-
-# No official Python Docker image ships a free-threaded ("t") build for any
-# version (checked docker-library/python's versions.json — not for 3.13,
-# 3.14, or the 3.15 release candidate), and 3.15 itself isn't GA yet
-# (3.15.0rc2, due 2026-10-01). So we compile free-threaded CPython 3.14.7
-# (latest stable release) from source instead, following the official
-# docker-library/python recipe with --disable-gil added.
-ENV PYTHON_VERSION=3.14.7
-ENV PYTHON_SHA256=3b48dac8fb59f62eaa67ac83c1eb12bda1b7a08406dd286e252c11a66be27f81
-
-RUN set -eux; \
-    savedAptMark="$(apt-mark showmanual)"; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        dpkg-dev \
-        g++ \
-        gcc \
-        gnupg \
-        libbluetooth-dev \
-        libbz2-dev \
-        libc6-dev \
-        libdb-dev \
-        libffi-dev \
-        libgdbm-dev \
-        liblzma-dev \
-        libncursesw5-dev \
-        libreadline-dev \
-        libsqlite3-dev \
-        libssl-dev \
-        libzstd-dev \
-        make \
-        tk-dev \
-        uuid-dev \
-        wget \
-        xz-utils \
-        zlib1g-dev \
-    ; \
-    \
-    wget -O python.tar.xz "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-$PYTHON_VERSION.tar.xz"; \
-    echo "$PYTHON_SHA256 *python.tar.xz" | sha256sum -c -; \
-    mkdir -p /usr/src/python; \
-    tar --extract --directory /usr/src/python --strip-components=1 --file python.tar.xz; \
-    rm python.tar.xz; \
-    \
-    cd /usr/src/python; \
-    gnuArch="$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)"; \
-    ./configure \
-        --build="$gnuArch" \
-        --disable-gil \
-        --enable-loadable-sqlite-extensions \
-        --enable-optimizations \
-        --enable-option-checking=fatal \
-        --enable-shared \
-        $(test "${gnuArch%%-*}" != 'riscv64' && echo '--with-lto') \
-        --with-ensurepip \
-    ; \
-    nproc="$(nproc)"; \
-    EXTRA_CFLAGS="$(dpkg-buildflags --get CFLAGS)"; \
-    LDFLAGS="$(dpkg-buildflags --get LDFLAGS)"; \
-    LDFLAGS="${LDFLAGS:-} -Wl,--strip-all"; \
-    make -j "$nproc" \
-        "EXTRA_CFLAGS=${EXTRA_CFLAGS:-}" \
-        "LDFLAGS=${LDFLAGS:-}" \
-    ; \
-    rm python; \
-    make -j "$nproc" \
-        "EXTRA_CFLAGS=${EXTRA_CFLAGS:-}" \
-        "LDFLAGS=${LDFLAGS:-} -Wl,-rpath='\$\$ORIGIN/../lib'" \
-        python \
-    ; \
-    make install; \
-    \
-    cd /; \
-    rm -rf /usr/src/python; \
-    \
-    find /usr/local -depth \
-        \( \
-            \( -type d -a \( -name test -o -name tests -o -name idle_test \) \) \
-            -o \( -type f -a \( -name '*.pyc' -o -name '*.pyo' -o -name 'libpython*.a' \) \) \
-        \) -exec rm -rf '{}' + \
-    ; \
-    \
-    ldconfig; \
-    \
-    apt-mark auto '.*' > /dev/null; \
-    apt-mark manual $savedAptMark; \
-    find /usr/local -type f -executable -not \( -name '*tkinter*' \) -exec ldd '{}' ';' \
-        | awk '/=>/ { so = $(NF-1); if (index(so, "/usr/local/") == 1) { next }; gsub("^/(usr/)?", "", so); printf "*%s\n", so }' \
-        | sort -u \
-        | xargs -rt dpkg-query --search \
-        | awk 'sub(":$", "", $1) { print $1 }' \
-        | sort -u \
-        | xargs -r apt-mark manual \
-    ; \
-    apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
-    rm -rf /var/lib/apt/lists/*; \
-    \
-    python3 --version; \
-    pip3 --version; \
-    python3 -c "import sys; assert not sys._is_gil_enabled(), 'free-threaded build check failed: GIL is enabled'"
-
-RUN set -eux; \
-    for src in idle3 pip3 pydoc3 python3 python3-config; do \
-        dst="$(echo "$src" | tr -d 3)"; \
-        [ -s "/usr/local/bin/$src" ]; \
-        [ ! -e "/usr/local/bin/$dst" ]; \
-        ln -svT "$src" "/usr/local/bin/$dst"; \
-    done
 
 # libmodsecurity3 runtime — loaded at startup via ctypes when MODSECURITY_ENABLED=true.
 # No compiler or dev headers needed; ctypes calls the C API in the shared library directly.
@@ -144,11 +31,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV MODSECURITY_ENABLED=true
 ENV MODSECURITY_RULES_FILE=/app/modsecurity.conf
-
-# Read by hypercorn_config.py -- kept below the CPython compile step so
-# changing these doesn't bust that (expensive) build cache layer.
-ENV HYPERCORN_WORKERS=1
-ENV HYPERCORN_WORKER_CLASS=asyncio
 
 COPY requirements.txt requirements-dev.txt .
 
