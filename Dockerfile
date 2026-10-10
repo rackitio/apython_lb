@@ -1,8 +1,11 @@
-# Free-threaded CPython 3.14.7, built by github.com/rackitio/pythont (see
-# that repo for why this isn't just FROM python:3.14-slim -- no official
+# Free-threaded CPython 3.15.0, built by github.com/rackitio/pythont (see
+# that repo for why this isn't just FROM python:3.15-slim -- no official
 # Python image ships a free-threaded build -- and for how to bump the
-# version here once pythont publishes a new one).
-FROM rackitio/pythont:3.14.7 AS base
+# version here once pythont publishes a new one). Pinned to an exact
+# X.Y.Z tag rather than pythont's stable/latest/X.Y channels, which move
+# and can jump a minor version out from under this image without warning
+# -- see pythont's README for the tag policy.
+FROM rackitio/pythont:3.15.0 AS base
 
 ENV SQLITE_DB=/app/data/apython_lb.db
 ENV DNS_NAMESERVERS="1.1.1.1"
@@ -40,8 +43,9 @@ COPY requirements.txt requirements-dev.txt .
 # supported in the free-threaded build") — so neither their upstream wheels
 # nor a stock source build work here. Fetch both and rebuild against the
 # full API instead, same as every other native dependency in this image
-# (cryptography, pycares, cffi all already ship real cp314t wheels). Revisit
-# once upstream does too:
+# (cryptography and cffi already ship real cp315t wheels; pycares doesn't
+# yet, hence cmake below -- that's just a missing wheel, unrelated to this
+# Limited API problem). Revisit once upstream does too:
 # https://github.com/aiortc/pylsqpack https://github.com/aiortc/aioquic
 #
 # Rebuilding fixes the compile, but not full free-threading: aioquic._buffer
@@ -110,11 +114,13 @@ PYSETUP
 
 # aioquic's _crypto extension links against libcrypto (-lcrypto), so
 # libssl-dev (purged after the Python build above) needs to come back for
-# this step alongside a compiler.
+# this step alongside a compiler. cmake is for pycares (aiodns's C
+# extension): no cp315t wheel exists yet, so pip builds it from source,
+# and pycares' own build now vendors c-ares via CMake.
 RUN set -eux; \
     savedAptMark="$(apt-mark showmanual)"; \
     apt-get update; \
-    apt-get install -y --no-install-recommends build-essential libssl-dev; \
+    apt-get install -y --no-install-recommends build-essential cmake libssl-dev; \
     pip install --no-cache-dir --upgrade pip; \
     pip install --no-cache-dir /tmp/pylsqpack-build /tmp/aioquic-build; \
     rm -rf /tmp/pylsqpack-build /tmp/aioquic-build; \
@@ -153,9 +159,9 @@ RUN rm -rf /app/tests /app/requirements-dev.txt
 #   - uvloop: hypercorn's uvloop_worker reuses that exact same asyncio code
 #     path, just with a different (still single-threaded) loop underneath.
 #     uvloop itself also isn't a concern here regardless: it ships real
-#     cp314t wheels and doesn't trigger CPython's GIL-reenable at all
-#     (confirmed empirically -- pip install uvloop; python3 -c "import
-#     uvloop" leaves sys._is_gil_enabled() False).
+#     cp314t/cp315t wheels and doesn't trigger CPython's GIL-reenable at
+#     all (confirmed empirically on both -- python3 -c "import uvloop"
+#     leaves sys._is_gil_enabled() False).
 # --workers scales by spawning separate OS processes (multiprocessing,
 # "spawn" start method), not threads, so instances are never shared across
 # workers, and each process starts fresh with this same PYTHON_GIL=0.

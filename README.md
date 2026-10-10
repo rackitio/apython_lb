@@ -260,9 +260,10 @@ in the Dockerfile's exec-form `CMD`, so this is where they're wired up):
 The `PYTHON_GIL=0` safety argument above was verified against both options:
 Hypercorn's `uvloop_worker` reuses the exact same single-threaded asyncio
 QUIC code path (just a different loop underneath), and `uvloop` itself
-ships real `cp314t` wheels and doesn't trigger CPython's GIL-reenable at
-all (confirmed empirically). See the Dockerfile comment for the full
-breakdown, including why trio was ruled out independent of any of this.
+ships real `cp314t`/`cp315t` wheels and doesn't trigger CPython's
+GIL-reenable at all (confirmed empirically on both). See the Dockerfile
+comment for the full breakdown, including why trio was ruled out
+independent of any of this.
 
 `HYPERCORN_WORKERS > 1` surfaced a real startup race, also fixed here:
 every worker process opens `/app/data/apython_lb.db` and switches it into

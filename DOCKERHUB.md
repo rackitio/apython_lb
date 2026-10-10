@@ -107,7 +107,7 @@ above.
 ## Image contents
 
 Base image: [`rackitio/pythont`](https://github.com/rackitio/pythont), a
-free-threaded CPython 3.14.7 (`--disable-gil`) build on `debian:trixie-slim`
+free-threaded CPython 3.15.0 (`--disable-gil`) build on `debian:trixie-slim`
 — no official Python image ships a free-threaded variant yet — plus
 `libmodsecurity-dev` for the WAF
 engine (loaded via `ctypes`, no compiler needed at runtime). Served over
