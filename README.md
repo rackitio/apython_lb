@@ -272,6 +272,29 @@ that doesn't honor the connection's `busy_timeout` — a losing worker used
 to crash outright on `database is locked` instead of just waiting.
 `classes/sqlite_db.py` now retries that specific case with backoff.
 
+## Performance
+
+Load tested with [k6](https://k6.io/) against a live deployment, exercising
+the full request path (WAF inspection, rate limiting, IP tracking, backend
+selection, and a real proxied response) rather than just `/health`. The
+script is at [`scripts/k6.js`](scripts/k6.js) — update the `BASE_URL` and
+`HOST_HEADER` constants at the top (or pass them as `-e` flags) to point it
+at your own deployment before running it.
+
+1,500 virtual users, ramped up over 30s, held for 1m, ramped down over 30s:
+
+| Metric | Result |
+|---|---|
+| Peak throughput | 925 req/s |
+| p95 latency | 1.03s (threshold was `<2s`) |
+| Failed requests | 0.00% (threshold was `<1%`) |
+| Completed iterations | 56,775, zero interrupted |
+| Checks passed | 113,550 / 113,550 (100%) |
+
+```
+k6 run -e BASE_URL=https://your-host -e HOST_HEADER=your.host.header scripts/k6.js
+```
+
 ## Running Locally
 Hypercorn serves TLS and expects `/app/cert.pem` and `/app/key.pem` inside the container. `*.pem` files are gitignored, so a fresh clone has none — without them every worker crashes at startup with `FileNotFoundError` from `create_ssl_context`. Generate a self-signed pair and mount it:
 

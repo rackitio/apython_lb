@@ -93,6 +93,13 @@ The full variable reference (20+ options covering IP tracking, sticky
 pinning, TLS verification, and WAF tuning) is in the project README linked
 above.
 
+## Performance
+
+Load tested at 1,500 concurrent virtual users against the full request
+path (WAF, rate limiting, backend selection — not just a health check):
+925 req/s peak, p95 latency 1.03s, 0.00% failed requests. Full numbers and
+the k6 script are in the [source repo's README](https://github.com/rackitio/apython_lb#performance).
+
 ## Security notes
 
 - `/v1/manage`, `/ws/configs`, and `/metrics` are restricted to internal
