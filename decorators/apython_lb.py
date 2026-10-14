@@ -42,7 +42,10 @@ _HOP_BY_HOP_HEADERS = {
 _REQUEST_EXCLUDED_HEADERS = _HOP_BY_HOP_HEADERS | {"content-length"}
 # Response side: httpx transparently decompresses bodies, so the upstream
 # Content-Encoding/Content-Length no longer describe the bytes we forward.
-_RESPONSE_EXCLUDED_HEADERS = _HOP_BY_HOP_HEADERS | {"content-length", "content-encoding"}
+# "server" is also stripped -- otherwise the backend's own server banner
+# (e.g. "gunicorn") passes through next to Hypercorn's, leaking stack
+# details on both ends of the proxy (an OWASP ZAP finding).
+_RESPONSE_EXCLUDED_HEADERS = _HOP_BY_HOP_HEADERS | {"content-length", "content-encoding", "server"}
 
 # RFC 9110 idempotent methods — safe to replay after an ambiguous failure.
 _IDEMPOTENT_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"}

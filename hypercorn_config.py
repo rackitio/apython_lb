@@ -29,3 +29,9 @@ logconfig_dict = build_logging_config()
 # startup regardless of GIL/free-threading, so it isn't offered as a choice.
 workers = int(os.environ.get("HYPERCORN_WORKERS", "1"))
 worker_class = os.environ.get("HYPERCORN_WORKER_CLASS", "asyncio")
+
+# Hypercorn stamps its own "server: hypercorn-h11"/"hypercorn-h2" header by
+# default, leaking the server software/stack to anyone probing the edge
+# (flagged by an OWASP ZAP scan). Backend "server" headers are stripped
+# separately in decorators/apython_lb.py's _RESPONSE_EXCLUDED_HEADERS.
+include_server_header = False
