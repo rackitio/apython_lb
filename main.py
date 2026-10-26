@@ -7,8 +7,8 @@ import time
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from quart import Quart, Response, request
 
-from classes import AsyncDb, BackendManager, IPTracker, ModSecurityEngine, RateLimiter
-from decorators import apython_lb, internal_only, modsec_waf, rate_limit
+from classes import AsyncDb, BackendManager, IPTracker, ModSecurityEngine, RateLimiter, RouteManager
+from decorators import dynamic_route, internal_only, modsec_waf, rate_limit
 from log_config import configure_logging
 from metrics import (
     HTTP_REQUEST_DURATION_SECONDS,
@@ -28,6 +28,8 @@ app = Quart(__name__)
 db = AsyncDb()
 backend_manager = BackendManager(db)
 app.backend_manager = backend_manager
+route_manager = RouteManager()
+app.route_manager = route_manager
 app.ip_tracker = IPTracker(
     threshold=int(os.environ.get("IP_TRACKER_404_THRESHOLD", 4)),
     window=int(os.environ.get("IP_TRACKER_WINDOW_SECONDS", 120)),  # count 404s within this window
@@ -66,6 +68,13 @@ async def startup():
     await db.initialize()
     app.add_background_task(backend_manager.start)
 
+    # Loaded synchronously (and fail loud if routes.toml is missing/invalid)
+    # so the route table is populated before the app accepts its first
+    # request -- route_manager.start() below only handles reloading after
+    # this, not the initial load.
+    route_manager.load_now()
+    app.add_background_task(route_manager.start)
+
 
 @app.after_serving
 async def shutdown():
@@ -73,7 +82,29 @@ async def shutdown():
 
 
 def _endpoint_label() -> str:
+    """
+    Used for HTTP_REQUESTS_IN_PROGRESS, which is inc()'d in _start_request_timer
+    (before routing resolves which dynamic route matched) and dec()'d in
+    _record_request_metrics (after). Both calls must use the same label or the
+    gauge drifts out of sync per-label, so this always uses the Werkzeug rule
+    -- known before the view runs -- never dynamic_route's more specific
+    per-entry label. See _metrics_endpoint_label() for that.
+    """
     return request.url_rule.rule if request.url_rule else "unmatched"
+
+
+def _metrics_endpoint_label() -> str:
+    """
+    Used by HTTP_REQUEST_DURATION_SECONDS/HTTP_REQUESTS_TOTAL, both recorded
+    exactly once per request in _record_request_metrics -- no paired inc/dec
+    to keep consistent, so unlike _endpoint_label() above this can safely
+    prefer the specific route dynamic_route resolved (decorators/apython_lb.py
+    stashes it on request._route_entry_path), so dashboards keep per-route
+    labels instead of every dynamic route collapsing into one generic
+    "/<path:path>" bucket. Falls back to the Werkzeug rule for static routes
+    (/health, /metrics) and unmatched requests, same as before this existed.
+    """
+    return getattr(request, "_route_entry_path", None) or _endpoint_label()
 
 
 @app.before_request
@@ -84,8 +115,8 @@ async def _start_request_timer():
 
 @app.after_request
 async def _record_request_metrics(response):
-    endpoint = _endpoint_label()
-    HTTP_REQUESTS_IN_PROGRESS.labels(method=request.method, endpoint=endpoint).dec()
+    HTTP_REQUESTS_IN_PROGRESS.labels(method=request.method, endpoint=_endpoint_label()).dec()
+    endpoint = _metrics_endpoint_label()
     duration = time.monotonic() - getattr(request, "_metrics_start", time.monotonic())
     HTTP_REQUEST_DURATION_SECONDS.labels(method=request.method, endpoint=endpoint).observe(duration)
     HTTP_REQUESTS_TOTAL.labels(
@@ -94,27 +125,30 @@ async def _record_request_metrics(response):
     return response
 
 
-@app.route("/", defaults={"path": ""}, endpoint="index_default")
-@app.route("/<path:path>", methods=["GET", "POST"], endpoint="index_default")
-@rate_limit
-@modsec_waf
-@apython_lb(backend_name="my_backend", route_policy="round_robin")
-def index(path):
-    pass
+# Every proxied route is configured dynamically via routes.toml
+# (ROUTE_CONFIG_FILE, default /app/routes.toml) -- see classes/route_manager.py
+# and README.md for the file format. One generic dispatcher here, fanning out
+# at request time to however many [[routes]] entries are configured, matched
+# by longest path prefix; dynamic_route (decorators/apython_lb.py) does the
+# lookup and 404s/405s before any backend is ever selected.
+#
+# Both rules below register the same broad method set at the Werkzeug level,
+# including the "/" rule -- a RouteEntry's own `methods` field is what
+# actually narrows things down per path, in dynamic_route. If "/" registered
+# a narrower set here (e.g. the GET/HEAD/OPTIONS Werkzeug defaults to when
+# methods= is omitted), Werkzeug itself would reject anything else with its
+# own 405 before dynamic_route ever got a chance to consult routes.toml --
+# which would make a routes.toml entry for path "/" with, say,
+# methods = ["POST"] silently impossible to satisfy.
+_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
-# Strip a /v1 prefix before forwarding
-@app.route("/v1/", defaults={"path": ""})
-@app.route("/v1/<path:path>", methods=["GET", "POST"])
+@app.route("/", defaults={"path": ""}, methods=_PROXY_METHODS, endpoint="proxy")
+@app.route("/<path:path>", methods=_PROXY_METHODS, endpoint="proxy")
 @rate_limit
 @modsec_waf
-@apython_lb(
-    backend_name="dns_backend",
-    route_policy="sticky_ip",
-    url_match=r"^v1/(.+)$",
-    url_rewrite=r"\1",
-)
-def v1_proxy(path):
+@dynamic_route
+def proxy(path):
     pass
 
 
