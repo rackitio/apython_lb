@@ -22,13 +22,17 @@
 #   url_rewrite   optional. Replacement for url_match; \1/\g<name> group
 #                 references supported. Only meaningful alongside url_match.
 #   methods       optional. List of HTTP methods this mapping accepts (e.g.
-#                 ["GET"]). Omit to allow every method the app registers for
-#                 proxied routes (GET, POST, PUT, PATCH, DELETE).
+#                 ["GET"]). Omit to default to ["GET", "POST"] -- shown
+#                 explicitly below so every available field is visible in
+#                 this default file, even where it's just the default value.
+#                 A request whose method isn't in this list gets a 405 with
+#                 an Allow header, not a silent fallthrough to another route.
 
 [[routes]]
 path = "/"
 backend_name = "my_backend"
 route_policy = "round_robin"
+methods = ["GET", "POST"]
 
 [[routes]]
 path = "/v1/"
@@ -36,3 +40,4 @@ backend_name = "dns_backend"
 route_policy = "sticky_ip"
 url_match = '^v1/(.+)$'
 url_rewrite = '\1'
+methods = ["GET", "POST"]

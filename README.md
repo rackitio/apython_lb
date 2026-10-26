@@ -123,6 +123,7 @@ mapping for the incoming path at request time via `classes/route_manager.py`.
 path = "/"
 backend_name = "my_backend"
 route_policy = "round_robin"
+methods = ["GET", "POST"]
 
 [[routes]]
 path = "/v1/"
@@ -130,12 +131,15 @@ backend_name = "dns_backend"
 route_policy = "sticky_ip"
 url_match = '^v1/(.+)$'
 url_rewrite = '\1'
+methods = ["GET", "POST"]
 
+# Not part of the shipped default -- an example of restricting methods, e.g.
+# a read-only path that should 405 on anything but GET.
 [[routes]]
 path = "/reports/"
 backend_name = "reports_backend"
 route_policy = "round_robin"
-methods = ["GET"]           # omit to allow GET and POST (the default)
+methods = ["GET"]
 ```
 
 | Field | Required | Description |
