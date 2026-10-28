@@ -13,6 +13,7 @@ from lb_settings import (
     LB_UPSTREAM_HTTP2,
     LB_UPSTREAM_TIMEOUT_SECONDS,
     LB_UPSTREAM_VERIFY_TLS,
+    VALID_POLICIES,
 )
 from metrics import (
     LB_BACKEND_ERRORS_TOTAL,
@@ -23,7 +24,6 @@ from metrics import (
 
 logger = logging.getLogger(__name__)
 
-VALID_POLICIES = {"round_robin", "sticky_session", "sticky_ip"}
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 # RFC 9110 hop-by-hop headers — they describe the connection between two hops
@@ -135,6 +135,171 @@ async def _resolve_backend(backend: str, dns_resolver) -> str:
     return resolved
 
 
+async def _forward(
+    backend_name: str,
+    route_policy: str,
+    url_match: str | None,
+    url_rewrite: str | None,
+    raw_path: str,
+) -> Response:
+    """
+    Core proxying logic: rewrite, backend selection with retry/circuit
+    -breaking, and the actual upstream request. Shared by both apython_lb()
+    (static, decorator-time config) and dynamic_route (request-time config
+    resolved from RouteManager) -- everything from here down is identical
+    either way once the four config values and the raw path are known.
+    """
+    # ── URL rewrite (nginx-style) — applied before any routing ───── #
+    path = _apply_rewrite(raw_path, url_match, url_rewrite)
+
+    attempt = 0
+    session_id = None
+    sticky_ip = current_app.backend_manager.get_sticky_ip()
+
+    client_ip = request.remote_addr
+    logger.debug(f"Request received from {client_ip}")
+
+    # ── Early penalty check — before hitting any backend ─────────── #
+    if await current_app.ip_tracker.is_penalised(client_ip):
+        logger.debug(f"Blocked penalised IP {client_ip!r}")
+        return Response(
+            "Too many errors. Try again later.",
+            status=429,
+            headers={"Retry-After": "300", "Connection": "close"},
+        )
+
+    rr = current_app.backend_manager.get_healthy_backends(backend_name)
+    if not rr:
+        logger.debug(f"No backend pool found for '{backend_name}'")
+        return Response(
+            json.dumps({"error": f"No backend pool for '{backend_name}'"}),
+            status=503,
+            content_type="application/json",
+        )
+
+    if route_policy == "sticky_session":
+        if "session_id" not in session:
+            session["session_id"] = str(uuid.uuid4())
+        session_id = session["session_id"]
+
+    while attempt < LB_MAX_ATTEMPTS:
+        # ── Routing — select a backend per policy on every attempt ──── #
+        if route_policy == "sticky_ip":
+            healthy_backend = await sticky_ip.get_next(client_ip, rr)
+        else:  # sticky_session (session_id set) or round_robin (None)
+            healthy_backend = await rr.get_next(session_id=session_id)
+        logger.debug(f"Selected backend ({route_policy}): {healthy_backend}")
+
+        if not healthy_backend:
+            LB_NO_HEALTHY_BACKENDS_TOTAL.labels(backend_name=backend_name).inc()
+            return Response(
+                json.dumps({"error": "No healthy backends available"}),
+                status=503,
+                content_type="application/json",
+            )
+
+        LB_BACKEND_SELECTIONS_TOTAL.labels(backend_name=backend_name, policy=route_policy).inc()
+
+        # ── Resolve hostname → IP at request time (no-op for raw IPs) ── #
+        resolved_backend = await _resolve_backend(
+            healthy_backend, current_app.backend_manager.dns_resolver
+        )
+
+        url = f"{resolved_backend}/{path}"
+        logger.debug(f"Forwarding request to: {url}")
+
+        try:
+            method = request.method
+            body = await request.get_data()
+            headers = _strip_headers(dict(request.headers), _REQUEST_EXCLUDED_HEADERS)
+            headers["X-Forwarded-Proto"] = request.scheme
+            headers["X-Forwarded-Host"] = request.host
+            # Add X-Forwarded-For header
+            existing_xff = headers.get("X-Forwarded-For")
+            if existing_xff:
+                headers["X-Forwarded-For"] = f"{existing_xff}, {client_ip}"
+            else:
+                headers["X-Forwarded-For"] = client_ip
+
+            async with httpx.AsyncClient(
+                http2=LB_UPSTREAM_HTTP2, verify=LB_UPSTREAM_VERIFY_TLS
+            ) as client:
+                try:
+                    response = await client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        content=body,
+                        params=request.args,
+                        timeout=LB_UPSTREAM_TIMEOUT_SECONDS,
+                    )
+
+                    # ── 404 tracking (all policies) ───────────────── #
+                    penalty = await _check_and_record_404(client_ip, response.status_code)
+                    if penalty:
+                        return penalty
+
+                    response.raise_for_status()
+
+                    return Response(
+                        response.content,
+                        status=response.status_code,
+                        headers=_strip_headers(dict(response.headers), _RESPONSE_EXCLUDED_HEADERS),
+                    )
+
+                except HTTPStatusError as e:
+                    return Response(
+                        e.response.content,
+                        status=e.response.status_code,
+                        headers=_strip_headers(
+                            dict(e.response.headers), _RESPONSE_EXCLUDED_HEADERS
+                        ),
+                    )
+
+                except (TimeoutException, ConnectError) as e:
+                    logger.debug(f"Connection error or timeout for {url}: {str(e)}")
+                    await rr.delete(healthy_backend)
+                    await sticky_ip.delete_backend(healthy_backend)
+                    attempt += 1
+                    LB_RETRIES_TOTAL.labels(backend_name=backend_name).inc()
+                    if attempt >= LB_MAX_ATTEMPTS or not _safe_to_retry(method, e):
+                        LB_BACKEND_ERRORS_TOTAL.labels(
+                            backend_name=backend_name, error_type="timeout"
+                        ).inc()
+                        return Response(
+                            json.dumps({"error": "All backend requests failed"}),
+                            status=504,
+                            content_type="application/json",
+                        )
+                    continue
+
+        except RequestError as e:
+            logger.debug(f"Error making request to {url}: {e}")
+            await rr.delete(healthy_backend)
+            await sticky_ip.delete_backend(healthy_backend)
+            attempt += 1
+            LB_RETRIES_TOTAL.labels(backend_name=backend_name).inc()
+            if attempt >= LB_MAX_ATTEMPTS or not _safe_to_retry(request.method, e):
+                LB_BACKEND_ERRORS_TOTAL.labels(
+                    backend_name=backend_name, error_type="request_error"
+                ).inc()
+                return Response(
+                    json.dumps({"error": "All backend requests failed"}),
+                    status=502,
+                    content_type="application/json",
+                )
+            continue
+
+        except Exception as e:
+            logger.debug(f"Unexpected error in load_balance: {e}")
+            LB_BACKEND_ERRORS_TOTAL.labels(backend_name=backend_name, error_type="unexpected").inc()
+            return Response(
+                json.dumps({"error": "Internal server error"}),
+                status=500,
+                content_type="application/json",
+            )
+
+
 def apython_lb(
     func=None,
     *,
@@ -143,6 +308,12 @@ def apython_lb(
     url_match: str = None,
     url_rewrite: str = None,
 ):
+    """
+    Statically configure a route's backend/policy/rewrite at decoration time
+    -- the original, code-defined way to wire up a proxied route. For routes
+    that should come from the dynamic routes.toml table instead, use
+    @dynamic_route below.
+    """
     if func is None:
         return functools.partial(
             apython_lb,
@@ -165,159 +336,52 @@ def apython_lb(
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         raw_path = kwargs.get("path", "")
+        return await _forward(backend_name, route_policy, url_match, url_rewrite, raw_path)
 
-        # ── URL rewrite (nginx-style) — applied before any routing ───── #
-        path = _apply_rewrite(raw_path, url_match, url_rewrite)
+    return wrapper
 
-        attempt = 0
-        session_id = None
-        sticky_ip = current_app.backend_manager.get_sticky_ip()
 
-        client_ip = request.remote_addr
-        logger.debug(f"Request received from {client_ip}")
+def dynamic_route(func):
+    """
+    Resolve backend/policy/rewrite per-request from current_app.route_manager
+    (classes/route_manager.py) instead of from static decorator kwargs --
+    lets one registered app.route fan out to every path mapping configured in
+    routes.toml, looked up by longest-prefix match on the incoming path.
 
-        # ── Early penalty check — before hitting any backend ─────────── #
-        if await current_app.ip_tracker.is_penalised(client_ip):
-            logger.debug(f"Blocked penalised IP {client_ip!r}")
+    Unlike apython_lb(), takes no kwargs: there's nothing to configure at
+    decoration time since the whole point is that the mapping is looked up at
+    request time instead.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        raw_path = kwargs.get("path", "")
+        entry, method_allowed = current_app.route_manager.match(request.path, request.method)
+
+        if entry is None:
+            logger.debug(f"No route configured for path {request.path!r}")
             return Response(
-                "Too many errors. Try again later.",
-                status=429,
-                headers={"Retry-After": "300", "Connection": "close"},
+                json.dumps({"error": "Not found"}), status=404, content_type="application/json"
             )
 
-        rr = current_app.backend_manager.get_healthy_backends(backend_name)
-        if not rr:
-            logger.debug(f"No backend pool found for '{backend_name}'")
+        if not method_allowed:
+            logger.debug(f"Method {request.method!r} not allowed for route {entry.path!r}")
             return Response(
-                json.dumps({"error": f"No backend pool for '{backend_name}'"}),
-                status=503,
+                json.dumps({"error": "Method not allowed"}),
+                status=405,
+                headers={"Allow": ", ".join(sorted(entry.methods))},
                 content_type="application/json",
             )
 
-        if route_policy == "sticky_session":
-            if "session_id" not in session:
-                session["session_id"] = str(uuid.uuid4())
-            session_id = session["session_id"]
-
-        while attempt < LB_MAX_ATTEMPTS:
-            # ── Routing — select a backend per policy on every attempt ──── #
-            if route_policy == "sticky_ip":
-                healthy_backend = await sticky_ip.get_next(client_ip, rr)
-            else:  # sticky_session (session_id set) or round_robin (None)
-                healthy_backend = await rr.get_next(session_id=session_id)
-            logger.debug(f"Selected backend ({route_policy}): {healthy_backend}")
-
-            if not healthy_backend:
-                LB_NO_HEALTHY_BACKENDS_TOTAL.labels(backend_name=backend_name).inc()
-                return Response(
-                    json.dumps({"error": "No healthy backends available"}),
-                    status=503,
-                    content_type="application/json",
-                )
-
-            LB_BACKEND_SELECTIONS_TOTAL.labels(backend_name=backend_name, policy=route_policy).inc()
-
-            # ── Resolve hostname → IP at request time (no-op for raw IPs) ── #
-            resolved_backend = await _resolve_backend(
-                healthy_backend, current_app.backend_manager.dns_resolver
-            )
-
-            url = f"{resolved_backend}/{path}"
-            logger.debug(f"Forwarding request to: {url}")
-
-            try:
-                method = request.method
-                body = await request.get_data()
-                headers = _strip_headers(dict(request.headers), _REQUEST_EXCLUDED_HEADERS)
-                headers["X-Forwarded-Proto"] = request.scheme
-                headers["X-Forwarded-Host"] = request.host
-                # Add X-Forwarded-For header
-                existing_xff = headers.get("X-Forwarded-For")
-                if existing_xff:
-                    headers["X-Forwarded-For"] = f"{existing_xff}, {client_ip}"
-                else:
-                    headers["X-Forwarded-For"] = client_ip
-
-                async with httpx.AsyncClient(
-                    http2=LB_UPSTREAM_HTTP2, verify=LB_UPSTREAM_VERIFY_TLS
-                ) as client:
-                    try:
-                        response = await client.request(
-                            method,
-                            url,
-                            headers=headers,
-                            content=body,
-                            params=request.args,
-                            timeout=LB_UPSTREAM_TIMEOUT_SECONDS,
-                        )
-
-                        # ── 404 tracking (all policies) ───────────────── #
-                        penalty = await _check_and_record_404(client_ip, response.status_code)
-                        if penalty:
-                            return penalty
-
-                        response.raise_for_status()
-
-                        return Response(
-                            response.content,
-                            status=response.status_code,
-                            headers=_strip_headers(
-                                dict(response.headers), _RESPONSE_EXCLUDED_HEADERS
-                            ),
-                        )
-
-                    except HTTPStatusError as e:
-                        return Response(
-                            e.response.content,
-                            status=e.response.status_code,
-                            headers=_strip_headers(
-                                dict(e.response.headers), _RESPONSE_EXCLUDED_HEADERS
-                            ),
-                        )
-
-                    except (TimeoutException, ConnectError) as e:
-                        logger.debug(f"Connection error or timeout for {url}: {str(e)}")
-                        await rr.delete(healthy_backend)
-                        await sticky_ip.delete_backend(healthy_backend)
-                        attempt += 1
-                        LB_RETRIES_TOTAL.labels(backend_name=backend_name).inc()
-                        if attempt >= LB_MAX_ATTEMPTS or not _safe_to_retry(method, e):
-                            LB_BACKEND_ERRORS_TOTAL.labels(
-                                backend_name=backend_name, error_type="timeout"
-                            ).inc()
-                            return Response(
-                                json.dumps({"error": "All backend requests failed"}),
-                                status=504,
-                                content_type="application/json",
-                            )
-                        continue
-
-            except RequestError as e:
-                logger.debug(f"Error making request to {url}: {e}")
-                await rr.delete(healthy_backend)
-                await sticky_ip.delete_backend(healthy_backend)
-                attempt += 1
-                LB_RETRIES_TOTAL.labels(backend_name=backend_name).inc()
-                if attempt >= LB_MAX_ATTEMPTS or not _safe_to_retry(request.method, e):
-                    LB_BACKEND_ERRORS_TOTAL.labels(
-                        backend_name=backend_name, error_type="request_error"
-                    ).inc()
-                    return Response(
-                        json.dumps({"error": "All backend requests failed"}),
-                        status=502,
-                        content_type="application/json",
-                    )
-                continue
-
-            except Exception as e:
-                logger.debug(f"Unexpected error in load_balance: {e}")
-                LB_BACKEND_ERRORS_TOTAL.labels(
-                    backend_name=backend_name, error_type="unexpected"
-                ).inc()
-                return Response(
-                    json.dumps({"error": "Internal server error"}),
-                    status=500,
-                    content_type="application/json",
-                )
+        # raw_path is the Werkzeug-captured "path" kwarg (no leading slash,
+        # e.g. "v1/foo") -- the same form apython_lb()'s wrapper passes to
+        # _forward(), and what url_match/url_rewrite are written against.
+        # entry.path (used for matching above) is the leading-and-trailing-
+        # slash request.path form instead -- the two are deliberately not
+        # the same string.
+        request._route_entry_path = entry.path  # read by main.py's metrics label
+        return await _forward(
+            entry.backend_name, entry.route_policy, entry.url_match, entry.url_rewrite, raw_path
+        )
 
     return wrapper

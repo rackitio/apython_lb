@@ -1,0 +1,43 @@
+# Dynamic route configuration for apython_lb, loaded by classes/route_manager.py.
+#
+# Baked into the image at /app/routes.toml by default (see the Dockerfile),
+# the same way modsecurity.conf is -- override by mounting a different file
+# at the same path (Docker volume, or a Kubernetes ConfigMap) and setting
+# ROUTE_CONFIG_FILE if you move it elsewhere. Changes to the mounted file are
+# picked up automatically within one CONFIG_POLL_INTERVAL (default 10s), no
+# restart needed.
+#
+# Each [[routes]] entry maps a path prefix to a backend pool. The path with
+# the longest matching prefix wins (nginx `location`-block semantics) -- so
+# "/v1/" below is checked before the "/" catch-all for any request under
+# /v1/, regardless of the order the entries are written in.
+#
+# Fields:
+#   path          required. Must start and end with "/" (e.g. "/", "/v1/").
+#   backend_name  required. Must match a backend pool registered via
+#                 POST /v1/manage/configs (see README.md).
+#   route_policy  required. One of: round_robin, sticky_session, sticky_ip.
+#   url_match     optional. nginx-style regex applied to the path *after* the
+#                 prefix above is stripped by matching -- see url_rewrite.
+#   url_rewrite   optional. Replacement for url_match; \1/\g<name> group
+#                 references supported. Only meaningful alongside url_match.
+#   methods       optional. List of HTTP methods this mapping accepts (e.g.
+#                 ["GET"]). Omit to default to ["GET", "POST"] -- shown
+#                 explicitly below so every available field is visible in
+#                 this default file, even where it's just the default value.
+#                 A request whose method isn't in this list gets a 405 with
+#                 an Allow header, not a silent fallthrough to another route.
+
+[[routes]]
+path = "/"
+backend_name = "my_backend"
+route_policy = "round_robin"
+methods = ["GET", "POST"]
+
+[[routes]]
+path = "/v1/"
+backend_name = "dns_backend"
+route_policy = "sticky_ip"
+url_match = '^v1/(.+)$'
+url_rewrite = '\1'
+methods = ["GET", "POST"]
