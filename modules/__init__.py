@@ -1,1 +1,1 @@
-from .broadcast import broadcast_config_update, connected_clients
+from .broadcast import broadcast_config_update, broadcast_metrics_update, connected_clients

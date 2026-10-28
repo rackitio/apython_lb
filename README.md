@@ -63,7 +63,11 @@ matters.
   session whenever configs change or a health check alters the pool — no
   manual refresh needed. When multiple configs share a name, the last one in
   wins: the most recently created (or explicitly selected via the UI's
-  "select" button) config controls the backend pool for that name.
+  "select" button) config controls the backend pool for that name. The page
+  also shows live sparkline graphs per backend (healthy-server count,
+  retries, pool-exhaustion events) sampled directly from the in-process
+  Prometheus metrics — no external Prometheus/Grafana needed, see
+  [Metrics dashboard](#metrics-dashboard).
 
 ## Request Flow
 
@@ -118,6 +122,8 @@ flowchart TD
 | `MAX_CONTENT_LENGTH` | `16777216` | Maximum request body size in bytes (bodies are buffered in memory for WAF inspection and forwarding) |
 | `HEALTH_CHECK_INTERVAL` | `60` | How often (seconds) backends are health-checked. A backend is healthy only when it answers `GET /` with HTTP **200** (see [Health checks](#health-checks)) |
 | `CONFIG_POLL_INTERVAL` | `10` | How often (seconds) the DB is polled for config changes |
+| `METRICS_HISTORY_INTERVAL` | `5` | How often (seconds) the management UI's metrics sparklines are sampled — see [Metrics dashboard](#metrics-dashboard) |
+| `METRICS_HISTORY_POINTS` | `180` | How many samples of history each metrics sparkline keeps (default: ~15 minutes at the 5s interval default) |
 | `DNS_NAMESERVERS` | `8.8.8.8,1.1.1.1` | Comma-separated DNS nameservers for backend hostname resolution (the Docker image sets `1.1.1.1`) |
 | `LB_MAX_ATTEMPTS` | `3` | Total tries per request before giving up (initial attempt + retries on timeout/connect/request errors) |
 | `LB_UPSTREAM_HTTP2` | `true` | Whether the upstream httpx client negotiates HTTP/2 |
@@ -173,6 +179,35 @@ backend isn't the right trade-off:
   backend is healthy, ignoring the rest. Useful when one backend is a
   reliable signal that the container is correctly configured and the others
   are slower to warm up.
+
+## Metrics dashboard
+
+The `/v1/manage` page renders live sparkline graphs per backend directly
+from the metrics already defined in `metrics.py` — no external Prometheus
+server or Grafana needed, and nothing leaves the process to produce them.
+`classes/metrics_history.py` samples a curated set of metrics straight off
+the in-process registry (`.collect()`, not even an internal HTTP call to
+this app's own `/metrics`) on a fixed interval, keeping a short bounded
+rolling window per backend in memory, and the management WebSocket pushes
+updated sparklines to every connected admin session on that same cadence.
+
+Three charts per backend, chosen because together they show a backend-pool
+incident developing and resolving in real time:
+
+| Chart | Metric | Shape |
+|---|---|---|
+| Healthy servers | `backend_healthy_servers{backend_name}` | Raw value over time |
+| Retries / interval | `lb_retries_total{backend_name}` | Delta since the previous sample, not the cumulative total — a timeout storm should look like a spike, not a permanent plateau |
+| Pool-exhausted events / interval | `lb_no_healthy_backends_total{backend_name}` | Same delta treatment — this is the direct signal for "requests are 503ing because the pool emptied" |
+
+History resets on restart (it's a live-debugging aid, not an audit log) and
+is capped at `METRICS_HISTORY_POINTS` samples, taken every
+`METRICS_HISTORY_INTERVAL` seconds (defaults: 180 points at 5s intervals,
+~15 minutes of history). This is a view onto data that already exists for
+anyone scraping `/metrics` with a real Prometheus — it doesn't replace that
+for long-term retention, alerting, or cross-instance aggregation, it just
+means you don't need one stood up to *see* what's happening on this instance
+right now.
 
 ## Deployment notes
 
