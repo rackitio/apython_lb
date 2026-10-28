@@ -47,7 +47,7 @@ async def index():
         )
         backends_html = await render_template_string(ACTIVE_BACKENDS_TEMPLATE, backends=backends)
         metrics_html = await render_template_string(
-            METRICS_PANEL_TEMPLATE, panels=current_app.metrics_history.render_panels()
+            METRICS_PANEL_TEMPLATE, groups=current_app.metrics_history.render_panels()
         )
         await websocket.send(config_html + backends_html + metrics_html)
 

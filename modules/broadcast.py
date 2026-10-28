@@ -59,8 +59,8 @@ async def broadcast_metrics_update():
     broadcast_config_update()'s event-triggered broadcasts above -- metrics
     change continuously, not just when a config/backend-health event occurs.
     """
-    panels = current_app.metrics_history.render_panels()
-    payload = await render_template_string(METRICS_PANEL_TEMPLATE, panels=panels)
+    groups = current_app.metrics_history.render_panels()
+    payload = await render_template_string(METRICS_PANEL_TEMPLATE, groups=groups)
 
     disconnected = set()
     for client in connected_clients:

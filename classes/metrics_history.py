@@ -158,9 +158,13 @@ class MetricsHistory:
                     self._series_for(key).append((now, value))
 
     def render_panels(self) -> list[dict]:
-        """Returns one dict per (backend_name, tracked metric) panel, ready
-        for the METRICS_PANEL_TEMPLATE to iterate -- {"title": ..., "svg":
-        ...}. Backend names are discovered from whichever series are
+        """Returns one group per backend_name, each holding its own row of
+        panels -- [{"backend_name": ..., "panels": [{"title": ..., "svg":
+        ...}, ...]}, ...] -- ready for METRICS_PANEL_TEMPLATE to render one
+        row per backend rather than a single pool of cards that happens to
+        wrap wherever the browser's width cuts it off (which, with more than
+        one backend, mixed different backends' cards together on the same
+        row). Backend names are discovered from whichever series are
         actually present (a backend that's never had a retry or
         pool-exhaustion event simply won't have those two series yet; its
         healthy-servers gauge is always present once health-checked once)."""
@@ -172,18 +176,15 @@ class MetricsHistory:
             }
         )
 
-        panels = []
+        groups = []
         for backend_name in backend_names:
+            panels = []
             for _metric_obj, sample_name, _kind, label, color in _TRACKED:
                 key: SeriesKey = (sample_name, (("backend_name", backend_name),))
                 points = list(self._series.get(key, ()))
-                panels.append(
-                    {
-                        "title": f"{backend_name} — {label}",
-                        "svg": _render_sparkline(points, color=color),
-                    }
-                )
-        return panels
+                panels.append({"title": label, "svg": _render_sparkline(points, color=color)})
+            groups.append({"backend_name": backend_name, "panels": panels})
+        return groups
 
     async def start(self, on_sample: Callable[[], Awaitable[None]] | None = None):
         """Samples immediately, then on `interval`, forever. `on_sample` (if

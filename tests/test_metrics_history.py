@@ -94,6 +94,9 @@ def test_sample_now_ignores_created_sample(throwaway_metrics):
 
 
 def test_render_panels_groups_by_backend_name(throwaway_metrics):
+    """render_panels() returns one group per backend_name (each holding its
+    own row of panels), not a flat list -- so each backend's charts render
+    together as a row instead of wrapping arbitrarily across backends."""
     counter, gauge = throwaway_metrics
     gauge.labels(backend_name="my_backend").set(2)
     gauge.labels(backend_name="dns_backend").set(1)
@@ -102,14 +105,20 @@ def test_render_panels_groups_by_backend_name(throwaway_metrics):
     history, original, mh_module = _history_with_metrics(counter, gauge)
     try:
         history.sample_now()
-        panels = history.render_panels()
-        titles = {p["title"] for p in panels}
-        assert any("my_backend" in t and "healthy servers" in t for t in titles)
-        assert any("dns_backend" in t and "healthy servers" in t for t in titles)
-        assert any("my_backend" in t and "retries" in t for t in titles)
-        # dns_backend never had a retry -- its retries panel still renders
-        # (as "no data yet"), it just has an empty series.
-        assert any("dns_backend" in t and "retries" in t for t in titles)
+        groups = history.render_panels()
+        by_name = {g["backend_name"]: g["panels"] for g in groups}
+
+        assert set(by_name) == {"my_backend", "dns_backend"}
+
+        my_titles = {p["title"] for p in by_name["my_backend"]}
+        assert "healthy servers" in my_titles
+        assert "retries / interval" in my_titles
+
+        # dns_backend never had a retry -- its group still has a "retries"
+        # panel (rendered as "no data yet"), it just has an empty series.
+        dns_titles = {p["title"] for p in by_name["dns_backend"]}
+        assert "healthy servers" in dns_titles
+        assert "retries / interval" in dns_titles
     finally:
         mh_module._TRACKED = original
 

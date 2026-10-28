@@ -50,7 +50,7 @@ async def index():
         RATE_LIMIT_PARTIAL, rate_limit_data=rate_limit_data
     )
     metrics_html = await render_template_string(
-        METRICS_PANEL_TEMPLATE, panels=current_app.metrics_history.render_panels()
+        METRICS_PANEL_TEMPLATE, groups=current_app.metrics_history.render_panels()
     )
     return await render_template_string(
         CONFIG_WS_TEMPLATE,
