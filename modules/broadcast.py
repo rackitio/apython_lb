@@ -3,7 +3,7 @@ import logging
 from quart import current_app, render_template_string
 
 from classes import AsyncDb
-from templates import ACTIVE_BACKENDS_TEMPLATE, CONFIG_LIST_TEMPLATE
+from templates import ACTIVE_BACKENDS_TEMPLATE, CONFIG_LIST_TEMPLATE, METRICS_PANEL_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -47,5 +47,26 @@ async def broadcast_config_update():
             logger.debug(
                 f"[broadcast] Removed stale client, {len(connected_clients) - len(disconnected)} remaining."
             )
+
+    connected_clients.difference_update(disconnected)
+
+
+async def broadcast_metrics_update():
+    """
+    Broadcast the latest metrics sparklines to all connected management-UI
+    clients. Called by MetricsHistory's own sampling loop (classes/
+    metrics_history.py) on its sampling interval, independent of
+    broadcast_config_update()'s event-triggered broadcasts above -- metrics
+    change continuously, not just when a config/backend-health event occurs.
+    """
+    groups = current_app.metrics_history.render_panels()
+    payload = await render_template_string(METRICS_PANEL_TEMPLATE, groups=groups)
+
+    disconnected = set()
+    for client in connected_clients:
+        try:
+            await client.send(payload)
+        except Exception:
+            disconnected.add(client)
 
     connected_clients.difference_update(disconnected)

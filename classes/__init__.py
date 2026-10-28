@@ -14,3 +14,4 @@ from .sticky_ip import StickyIP
 from .rate_limiter import RateLimiter
 from .modsecurity import ModSecurityEngine
 from .route_manager import RouteEntry, RouteManager
+from .metrics_history import MetricsHistory
