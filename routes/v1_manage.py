@@ -2,7 +2,7 @@ from quart import Blueprint, current_app, render_template_string, request
 
 from classes import AsyncDb
 from decorators import ip_restriction
-from templates import CONFIG_WS_TEMPLATE
+from templates import CONFIG_WS_TEMPLATE, METRICS_PANEL_TEMPLATE
 
 db = AsyncDb()
 
@@ -49,8 +49,15 @@ async def index():
     rate_limit_html = await render_template_string(
         RATE_LIMIT_PARTIAL, rate_limit_data=rate_limit_data
     )
+    metrics_html = await render_template_string(
+        METRICS_PANEL_TEMPLATE, panels=current_app.metrics_history.render_panels()
+    )
     return await render_template_string(
-        CONFIG_WS_TEMPLATE, configs=configs, backends=backends, rate_limit_html=rate_limit_html
+        CONFIG_WS_TEMPLATE,
+        configs=configs,
+        backends=backends,
+        rate_limit_html=rate_limit_html,
+        metrics_html=metrics_html,
     )
 
 

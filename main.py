@@ -7,7 +7,14 @@ import time
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from quart import Quart, Response, request
 
-from classes import AsyncDb, BackendManager, IPTracker, ModSecurityEngine, RateLimiter
+from classes import (
+    AsyncDb,
+    BackendManager,
+    IPTracker,
+    MetricsHistory,
+    ModSecurityEngine,
+    RateLimiter,
+)
 from decorators import apython_lb, internal_only, modsec_waf, rate_limit
 from log_config import configure_logging
 from metrics import (
@@ -15,6 +22,7 @@ from metrics import (
     HTTP_REQUESTS_IN_PROGRESS,
     HTTP_REQUESTS_TOTAL,
 )
+from modules import broadcast_metrics_update
 from routes.v1_manage import v1_manage
 from routes.ws_configs import ws_configs
 
@@ -38,6 +46,7 @@ app.rate_limiter = RateLimiter(
     window=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", 60)),
 )
 app.modsec = ModSecurityEngine()
+app.metrics_history = MetricsHistory()
 
 # blueprints
 app.register_blueprint(v1_manage)
@@ -61,10 +70,18 @@ if not app.secret_key:
     )
 
 
+async def _run_metrics_history():
+    # Broadcasting needs current_app, which add_background_task provides by
+    # running this within the app context -- same as backend_manager.start's
+    # own background broadcast calls elsewhere in this codebase.
+    await app.metrics_history.start(on_sample=broadcast_metrics_update)
+
+
 @app.before_serving
 async def startup():
     await db.initialize()
     app.add_background_task(backend_manager.start)
+    app.add_background_task(_run_metrics_history)
 
 
 @app.after_serving

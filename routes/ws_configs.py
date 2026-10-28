@@ -6,7 +6,7 @@ from quart import Blueprint, current_app, render_template_string, websocket
 from classes import AsyncDb
 from decorators import ip_restriction
 from modules import broadcast_config_update, connected_clients
-from templates import ACTIVE_BACKENDS_TEMPLATE, CONFIG_LIST_TEMPLATE
+from templates import ACTIVE_BACKENDS_TEMPLATE, CONFIG_LIST_TEMPLATE, METRICS_PANEL_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,10 @@ async def index():
             CONFIG_LIST_TEMPLATE, configs=configs, backends=backends
         )
         backends_html = await render_template_string(ACTIVE_BACKENDS_TEMPLATE, backends=backends)
-        await websocket.send(config_html + backends_html)
+        metrics_html = await render_template_string(
+            METRICS_PANEL_TEMPLATE, panels=current_app.metrics_history.render_panels()
+        )
+        await websocket.send(config_html + backends_html + metrics_html)
 
         while True:
             # Client frames: "select:<id>" bumps LastSelected so that config

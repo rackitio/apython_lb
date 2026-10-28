@@ -23,6 +23,11 @@ CONFIG_WS_TEMPLATE = """
         .rate-table { border-collapse: collapse; width: 100%; max-width: 600px; }
         .rate-table th, .rate-table td { padding: 4px 10px; text-align: left; border-bottom: 1px solid #eee; }
         .btn-refresh { font-size: 0.82rem; padding: 3px 10px; cursor: pointer; margin-bottom: 8px; }
+        .metrics-grid { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+        .metrics-card { border: 1px solid #ddd; border-radius: 4px; padding: 8px 10px; }
+        .metrics-card-title { font-size: 0.78rem; color: #555; margin-bottom: 4px; }
+        .sparkline-latest { display: block; font-size: 0.78rem; color: #333; margin-top: 2px; }
+        .sparkline-empty text { font-style: italic; }
     </style>
     <script>
         // Send a raw websocket message to the HTMX WS extension socket.
@@ -38,6 +43,9 @@ CONFIG_WS_TEMPLATE = """
 </head>
 <!-- ws-connect established on body so wsSend() can reach it via htmx internals -->
 <body hx-ext="ws" ws-connect="/ws/configs">
+    <h3>Metrics</h3>
+    {{ metrics_html | safe }}
+
     <h3>Add Config</h3>
     <div class="config-form">
         <form hx-ext="json-enc"
