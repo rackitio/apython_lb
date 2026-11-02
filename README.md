@@ -133,7 +133,7 @@ methods = ["GET", "POST"]
 path = "/v1/"
 backend_name = "dns_backend"
 route_policy = "sticky_ip"
-url_match = '^v1/(.+)$'
+url_match = '^v1/?(.*)$'
 url_rewrite = '\1'
 methods = ["GET", "POST"]
 
@@ -151,10 +151,17 @@ methods = ["GET"]
 | `path` | yes | Must start and end with `/` (e.g. `/`, `/v1/`) — prefix-matched against the request path, **longest match wins** (nginx `location`-block semantics), so a more specific path doesn't need to be listed before a shorter one it overlaps with |
 | `backend_name` | yes | Must match a backend pool registered via `POST /v1/manage/configs` (see [Add backends via curl](#add-backends-via-curl)) |
 | `route_policy` | yes | `round_robin`, `sticky_session`, or `sticky_ip` |
-| `url_match` / `url_rewrite` | no | Same nginx-style rewrite as the static decorator — see [URL rewrite](#url-rewrite) |
+| `url_match` / `url_rewrite` | no | nginx-style rewrite, applied to the **full** forwarded path (no leading `/`, and **not** pre-stripped of the `path` prefix above — see the warning below) |
 | `methods` | no | List of HTTP methods this mapping accepts. Omitted = `GET` and `POST`. A path match with a disallowed method gets a `405` with an `Allow` header, not a silent fallthrough to another route |
 
 A request matching no configured `path` gets a `404`.
+
+> **⚠️ Breaking change (this PR): `url_match`/`url_rewrite` do not pre-strip the matched `path` prefix, and the shipped `/v1/` example's regex changed.**
+> `path` above only decides *which route wins* — it never removes anything from the string `url_match` sees. That string is the full Werkzeug-captured path, with no leading `/` (a request to `/v1/foo` gives `url_match` the literal string `"v1/foo"`). To strip a prefix, your own regex has to match it explicitly and not capture it, the same way the `/v1/` entry above does.
+>
+> That regex also has to account for a request with **nothing after the prefix** — `/v1` or `/v1/` itself, not `/v1/something`. `raw_path` in that case is `"v1"` or `"v1/"`, with no trailing segment for a `(.+)` (one-or-more) group to capture, so a pattern like `^v1/(.+)$` silently fails to match and the path gets forwarded completely **unrewritten** instead of hitting the backend's root — found during real load-testing of this PR (it manifests as a 404 from the backend, which can cascade into the [IP tracker](#variable-reference) penalizing the client after a few of them). The shipped `/v1/` entry now uses `^v1/?(.*)$` (optional slash, `*` instead of `+`) to handle all three shapes — `v1`, `v1/`, `v1/foo` — correctly. **If you're running a `routes.toml` from an earlier build of this branch with a `(.+)$`-style pattern, update it** — a bare request to that prefix now forwards differently (to the backend's root) than it did before, which is itself a behavior change worth testing before you roll it out.
+>
+> The static `apython_lb()` decorator's own `/v1/` example (below, under [URL rewrite](#url-rewrite)) does **not** need this change — it registers its own dedicated `@app.route("/v1/", defaults={"path": ""})` rule, which supplies an empty path directly for the bare-prefix case regardless of what the regex does. That per-route `defaults=` mechanism doesn't exist for the one shared dynamic dispatcher, which is why `routes.toml` entries need a regex that explicitly handles it.
 
 **Hot reload**: the file is re-read whenever its mtime changes, polled every
 `CONFIG_POLL_INTERVAL` seconds (the same interval `BackendManager` already
@@ -172,11 +179,25 @@ at a different path and mount your own file there to change it — a Docker
 volume locally, or a Kubernetes `ConfigMap` mounted into the pod, which
 `kubelet` keeps in sync with the file on disk automatically.
 
-**Static, code-defined routes are still supported** — `apython_lb()` (the
-original decorator, still in `decorators/apython_lb.py`) takes
-`backend_name`/`route_policy`/`url_match`/`url_rewrite` as decorator kwargs
-instead of resolving them from `routes.toml`, for anyone who'd rather wire a
-specific route in code. See [URL rewrite](#url-rewrite) for an example.
+**Static, code-defined routes are still supported, and coexist with `routes.toml`** —
+`apython_lb()` (the original decorator, still in `decorators/apython_lb.py`)
+takes `backend_name`/`route_policy`/`url_match`/`url_rewrite` as decorator
+kwargs instead of resolving them from `routes.toml`, for anyone who'd rather
+wire a specific route in code. See [URL rewrite](#url-rewrite) for an
+example. Register one alongside the generic dynamic dispatcher and both work
+at once — confirmed directly, not just assumed: Werkzeug ranks routes by
+specificity, not registration order, so a static route at a more specific
+path (e.g. `/special/<path:path>`) is always tried before the fully-generic
+`/<path:path>` dynamic catch-all, regardless of where either is registered.
+
+One real gotcha from that: if a static route's path **overlaps** with a
+`routes.toml` entry (the same path, or a prefix of it), the static route
+always wins for any URL it matches — Werkzeug never reaches `dynamic_route`
+for those requests at all. `RouteManager` has no visibility into the static
+side of the app, so an overlapping `routes.toml` entry isn't an error, it's
+just silently unreachable for that URL space. Keep static routes and
+`routes.toml` entries on non-overlapping paths unless shadowing part of a
+dynamic entry is actually what you want.
 
 There's no REST API for routes yet (unlike backend configs' `/v1/manage/configs`) — that's a planned follow-up; `routes.toml` is the only way to configure routing today.
 
@@ -476,19 +497,23 @@ Rejected requests get a `429` with a `Retry-After` header.
 
 ### URL rewrite
 The equivalent `routes.toml` entry for the common case (strip a `/v1`
-prefix before forwarding):
+prefix before forwarding). Note the `?` and `*` — this needs to match a bare
+`/v1` or `/v1/` request too, not just `/v1/something`; see the warning in
+[Dynamic route configuration](#dynamic-route-configuration) for why:
 ```toml
 [[routes]]
 path = "/v1/"
 backend_name = "my_backend"
 route_policy = "sticky_ip"
-url_match = '^v1/(.+)$'
+url_match = '^v1/?(.*)$'
 url_rewrite = '\1'
 ```
 
 The same thing with the static decorator, and two more rewrite patterns —
 useful if you want a specific route wired up in code rather than in
-`routes.toml`:
+`routes.toml`. This one doesn't need the `?`/`*` treatment above: its own
+dedicated `defaults={"path": ""}` rule already supplies an empty path for
+the bare-`/v1/`-or-`/v1` case directly, independent of what `url_match` does:
 ```python
 # Strip a /v1 prefix before forwarding
 @app.route("/v1/", defaults={"path": ""})

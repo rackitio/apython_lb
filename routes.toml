@@ -17,8 +17,27 @@
 #   backend_name  required. Must match a backend pool registered via
 #                 POST /v1/manage/configs (see README.md).
 #   route_policy  required. One of: round_robin, sticky_session, sticky_ip.
-#   url_match     optional. nginx-style regex applied to the path *after* the
-#                 prefix above is stripped by matching -- see url_rewrite.
+#   url_match     optional. nginx-style regex applied to the FULL forwarded
+#                 path, with no leading "/" (e.g. a request to "/v1/foo"
+#                 gives url_match the string "v1/foo") -- `path` above only
+#                 decides which route wins, it does NOT strip anything from
+#                 what url_match sees. If you want to strip a prefix, your
+#                 regex has to match it explicitly and not capture it, the
+#                 same way the "/v1/" entry below does: '^v1/?(.*)$' matches
+#                 "v1/" (or bare "v1", with no trailing slash at all -- see
+#                 next paragraph) at the start, no leading slash, and
+#                 captures only what comes after it. See url_rewrite.
+#
+#                 A request with nothing after the prefix -- "/v1" or "/v1/"
+#                 itself, not "/v1/something" -- still needs its own match:
+#                 raw_path is "v1" or "v1/" in that case, with no trailing
+#                 segment for a plain '^v1/(.+)$' to capture (the `+` means
+#                 "one or more", so zero characters after "v1/" fails to
+#                 match at all, and the path gets forwarded completely
+#                 unrewritten instead -- found the hard way, see PR #9).
+#                 '^v1/?(.*)$' (optional slash, `*` instead of `+`) handles
+#                 all three shapes -- "v1", "v1/", "v1/foo" -- rewriting the
+#                 first two to the backend's own root.
 #   url_rewrite   optional. Replacement for url_match; \1/\g<name> group
 #                 references supported. Only meaningful alongside url_match.
 #   methods       optional. List of HTTP methods this mapping accepts (e.g.
@@ -38,6 +57,6 @@ methods = ["GET", "POST"]
 path = "/v1/"
 backend_name = "dns_backend"
 route_policy = "sticky_ip"
-url_match = '^v1/(.+)$'
+url_match = '^v1/?(.*)$'
 url_rewrite = '\1'
 methods = ["GET", "POST"]
