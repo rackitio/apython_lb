@@ -35,11 +35,18 @@ history.
   overlapping `routes.toml` entry is silently shadowed if a static route
   also covers that path. ([#9](https://github.com/rackitio/apython_lb/pull/9))
 - **Live metrics dashboard** on `/v1/manage`: per-backend sparkline graphs
-  (healthy servers, retries/interval, pool-exhausted events/interval)
-  sampled directly from the in-process Prometheus registry on a fixed
-  interval (`METRICS_HISTORY_INTERVAL`/`METRICS_HISTORY_POINTS`) — no
-  external Prometheus/Grafana needed. Pushed to every connected admin
-  session over the existing `/ws/configs` WebSocket.
+  sampled directly from the in-process Prometheus registry (`metrics.py`)
+  on a fixed interval (`METRICS_HISTORY_INTERVAL`/`METRICS_HISTORY_POINTS`)
+  — no external Prometheus/Grafana needed. Three metrics per backend, one
+  chart each:
+  - `backend_healthy_servers{backend_name}` — raw gauge value over time
+  - `lb_retries_total{backend_name}` — delta since the previous sample (a
+    per-interval rate, not the raw cumulative counter)
+  - `lb_no_healthy_backends_total{backend_name}` — same delta treatment;
+    the direct signal for "requests are 503ing because the pool emptied"
+
+  Pushed to every connected admin session over the existing `/ws/configs`
+  WebSocket on the sampler's own interval.
   ([#10](https://github.com/rackitio/apython_lb/pull/10))
 
 ### Fixed
