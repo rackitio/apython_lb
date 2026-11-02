@@ -689,6 +689,9 @@ python3 -m pytest -q tests
 
 ## Releases
 
+See [CHANGELOG.md](CHANGELOG.md) for what's changed since the last tag,
+including any breaking changes — check it before upgrading.
+
 Releases are cut by pushing a semver tag. The `release` GitHub Actions
 workflow ([.github/workflows/release.yml](.github/workflows/release.yml))
 then:
