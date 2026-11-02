@@ -33,7 +33,11 @@ history.
   always wins over the generic dynamic catch-all (Werkzeug ranks by
   specificity, not registration order); the corresponding gotcha is that an
   overlapping `routes.toml` entry is silently shadowed if a static route
-  also covers that path. ([#9](https://github.com/rackitio/apython_lb/pull/9))
+  also covers that path. The `docs/k8s/deploy/` example manifests now show
+  (commented out, opt-in) how to mount a ConfigMap over the image's
+  baked-in default `routes.toml`, matching the existing TLS-secret
+  `subPath` mount pattern already used there.
+  ([#9](https://github.com/rackitio/apython_lb/pull/9))
 - **Live metrics dashboard** on `/v1/manage`: per-backend sparkline graphs
   sampled directly from the in-process Prometheus registry (`metrics.py`)
   on a fixed interval (`METRICS_HISTORY_INTERVAL`/`METRICS_HISTORY_POINTS`)

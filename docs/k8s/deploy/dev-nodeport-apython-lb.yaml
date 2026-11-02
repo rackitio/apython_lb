@@ -63,6 +63,19 @@ spec:
               mountPath: /app/key.pem
               subPath: key.pem
               readOnly: true
+            # Optional: override the routes.toml baked into the image (see
+            # README's "Dynamic route configuration") with a ConfigMap
+            # instead. Create it first:
+            #   kubectl create configmap apython-lb-routes --from-file=routes.toml
+            # kubelet keeps this file in sync with the ConfigMap
+            # automatically; apython_lb picks up an edit within one
+            # CONFIG_POLL_INTERVAL, no pod restart needed. Leave both this
+            # and the matching entry under `volumes:` below commented out
+            # to keep using the image's baked-in default.
+            # - name: apython-lb-routes
+            #   mountPath: /app/routes.toml
+            #   subPath: routes.toml
+            #   readOnly: true
           env:
             - name: SQLITE_DB
               value: /app/data/apython_lb.db
@@ -109,6 +122,11 @@ spec:
                 path: cert.pem
               - key: tls.key
                 path: key.pem
+        # Paired with the commented-out volumeMount above -- uncomment both
+        # together to override routes.toml via a ConfigMap.
+        # - name: apython-lb-routes
+        #   configMap:
+        #     name: apython-lb-routes
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler
