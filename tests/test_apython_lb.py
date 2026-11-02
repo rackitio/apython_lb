@@ -4,9 +4,10 @@ import pytest
 from quart import Quart
 
 from classes.ip_tracker import IPTracker
+from classes.route_manager import RouteEntry
 from classes.sticky_ip import StickyIP
 from classes.sticky_session import StickyRoundRobin
-from decorators.apython_lb import apython_lb
+from decorators.apython_lb import apython_lb, dynamic_route
 
 # "import decorators.apython_lb" would resolve to the function re-exported by
 # the package __init__, not the submodule — load the module explicitly.
@@ -222,3 +223,112 @@ async def test_get_retried_after_read_timeout(monkeypatch):
 
     assert len(FakeAsyncClient.requests) == 2
     assert resp.status_code == 503
+
+
+# ── dynamic_route tests ─────────────────────────────────────────────────── #
+# dynamic_route resolves backend_name/route_policy/url_match/url_rewrite from
+# current_app.route_manager.match() at request time instead of from decorator
+# kwargs, then calls the exact same _forward() apython_lb() uses above -- so
+# these only need to cover the resolution/404/405 behavior that's new; retry,
+# header-hygiene, and policy behavior are already covered by the apython_lb()
+# tests above, since both decorators share that code.
+
+
+class FakeRouteManager:
+    """Stand-in for classes.route_manager.RouteManager — same match()
+    contract (longest-prefix match, (entry, method_allowed) tuple) without
+    reading from an actual TOML file."""
+
+    def __init__(self, entries: list[RouteEntry]):
+        self._entries = sorted(entries, key=lambda e: len(e.path), reverse=True)
+
+    def match(self, request_path: str, method: str):
+        method = method.upper()
+        for entry in self._entries:
+            if request_path.startswith(entry.path) or request_path == entry.path.rstrip("/"):
+                return entry, method in entry.methods
+        return None, False
+
+
+def make_dynamic_app(entries: list[RouteEntry]) -> Quart:
+    app = Quart(__name__)
+    app.secret_key = "test-secret"
+    app.backend_manager = FakeBackendManager()
+    app.ip_tracker = IPTracker(threshold=100, window=60, duration=60)
+    app.route_manager = FakeRouteManager(entries)
+
+    # Both rules register the same broad method set -- see the matching
+    # comment in main.py: "/" must not be narrower than "/<path:path>", or
+    # Werkzeug's own 405 would preempt dynamic_route's per-entry methods
+    # check for anything configured at path "/".
+    proxy_methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+
+    @app.route("/", defaults={"path": ""}, methods=proxy_methods)
+    @app.route("/<path:path>", methods=proxy_methods)
+    @dynamic_route
+    def proxy(path):
+        pass
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_dynamic_route_forwards_to_matched_backend():
+    app = make_dynamic_app([RouteEntry(path="/", backend_name="pool", route_policy="round_robin")])
+
+    resp = await app.test_client().get("/anything")
+
+    assert resp.status_code == 200
+    assert len(FakeAsyncClient.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_dynamic_route_longest_prefix_wins_and_rewrite_applies():
+    entries = [
+        RouteEntry(path="/", backend_name="root_pool", route_policy="round_robin"),
+        RouteEntry(
+            path="/v1/",
+            backend_name="v1_pool",
+            route_policy="round_robin",
+            url_match=r"^v1/(.+)$",
+            url_rewrite=r"\1",
+        ),
+    ]
+    app = make_dynamic_app(entries)
+
+    await app.test_client().get("/v1/foo")
+
+    # The more specific "/v1/" entry (not the "/" catch-all) must have been
+    # selected, and its url_rewrite must have stripped the "v1/" prefix.
+    assert FakeAsyncClient.requests[-1].endswith("/foo")
+
+
+@pytest.mark.asyncio
+async def test_dynamic_route_404_when_no_path_matches():
+    app = make_dynamic_app(
+        [RouteEntry(path="/v1/", backend_name="pool", route_policy="round_robin")]
+    )
+
+    resp = await app.test_client().get("/unmatched")
+
+    assert resp.status_code == 404
+    assert not FakeAsyncClient.requests  # request never reached a backend
+
+
+@pytest.mark.asyncio
+async def test_dynamic_route_405_when_method_not_allowed():
+    entries = [
+        RouteEntry(
+            path="/",
+            backend_name="pool",
+            route_policy="round_robin",
+            methods=frozenset({"GET"}),
+        )
+    ]
+    app = make_dynamic_app(entries)
+
+    resp = await app.test_client().post("/")
+
+    assert resp.status_code == 405
+    assert resp.headers["Allow"] == "GET"
+    assert not FakeAsyncClient.requests

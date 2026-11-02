@@ -37,6 +37,10 @@ matters.
   without cookies.
 - **Sticky by session** — pins a signed session to the same backend for
   cookie-based affinity.
+- **Dynamic routing** — path → backend/policy/rewrite mappings are configured
+  in `routes.toml` (see [Dynamic route configuration](#dynamic-route-configuration)),
+  hot-reloaded on change — no code change or redeploy to add, change, or
+  remove a route.
 - **URL rewriting** — match and rewrite request paths before forwarding (strip
   or inject prefixes, remap routes) via per-route `url_match`/`url_rewrite`
   regex patterns.
@@ -82,10 +86,13 @@ flowchart TD
     D -->|exceeded| D1([429 Retry-After])
     D -->|ok| E{"@modsec_waf<br/>WAF inspection"}
     E -->|blocked| E1([403 / 400 / 414])
-    E -->|allowed| F[/"@apython_lb"/]
+    E -->|allowed| F{"@dynamic_route<br/>match path in routes.toml?"}
+    F -->|no path match| F1([404 Not found])
+    F -->|method not allowed| F2([405 + Allow header])
+    F -->|matched| F3[/"_forward()"/]
 
-    subgraph LB [apython_lb]
-        F --> G[URL rewrite<br/>url_match / url_rewrite]
+    subgraph LB ["_forward() -- shared by @dynamic_route and @apython_lb"]
+        F3 --> G[URL rewrite<br/>url_match / url_rewrite]
         G --> H{IP tracker<br/>penalised?}
         H -->|yes| H1([429 Retry-After])
         H -->|no| I{Healthy backend<br/>pool exists?}
@@ -107,6 +114,93 @@ flowchart TD
     R --> S([Response to client])
 ```
 
+## Dynamic route configuration
+
+Every proxied route is configured in `routes.toml` (loaded from
+`ROUTE_CONFIG_FILE`, default `/app/routes.toml`), not hardcoded in `main.py`.
+One `@app.route("/<path:path>")` dispatcher (`@dynamic_route`, in
+`decorators/apython_lb.py`) handles every request, looking up the configured
+mapping for the incoming path at request time via `classes/route_manager.py`.
+
+```toml
+[[routes]]
+path = "/"
+backend_name = "my_backend"
+route_policy = "round_robin"
+methods = ["GET", "POST"]
+
+[[routes]]
+path = "/v1/"
+backend_name = "dns_backend"
+route_policy = "sticky_ip"
+url_match = '^v1/?(.*)$'
+url_rewrite = '\1'
+methods = ["GET", "POST"]
+
+# Not part of the shipped default -- an example of restricting methods, e.g.
+# a read-only path that should 405 on anything but GET.
+[[routes]]
+path = "/reports/"
+backend_name = "reports_backend"
+route_policy = "round_robin"
+methods = ["GET"]
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `path` | yes | Must start and end with `/` (e.g. `/`, `/v1/`) — prefix-matched against the request path, **longest match wins** (nginx `location`-block semantics), so a more specific path doesn't need to be listed before a shorter one it overlaps with |
+| `backend_name` | yes | Must match a backend pool registered via `POST /v1/manage/configs` (see [Add backends via curl](#add-backends-via-curl)) |
+| `route_policy` | yes | `round_robin`, `sticky_session`, or `sticky_ip` |
+| `url_match` / `url_rewrite` | no | nginx-style rewrite, applied to the **full** forwarded path (no leading `/`, and **not** pre-stripped of the `path` prefix above — see the warning below) |
+| `methods` | no | List of HTTP methods this mapping accepts. Omitted = `GET` and `POST`. A path match with a disallowed method gets a `405` with an `Allow` header, not a silent fallthrough to another route |
+
+A request matching no configured `path` gets a `404`.
+
+> **⚠️ Breaking change (this PR): `url_match`/`url_rewrite` do not pre-strip the matched `path` prefix, and the shipped `/v1/` example's regex changed.**
+> `path` above only decides *which route wins* — it never removes anything from the string `url_match` sees. That string is the full Werkzeug-captured path, with no leading `/` (a request to `/v1/foo` gives `url_match` the literal string `"v1/foo"`). To strip a prefix, your own regex has to match it explicitly and not capture it, the same way the `/v1/` entry above does.
+>
+> That regex also has to account for a request with **nothing after the prefix** — `/v1` or `/v1/` itself, not `/v1/something`. `raw_path` in that case is `"v1"` or `"v1/"`, with no trailing segment for a `(.+)` (one-or-more) group to capture, so a pattern like `^v1/(.+)$` silently fails to match and the path gets forwarded completely **unrewritten** instead of hitting the backend's root — found during real load-testing of this PR (it manifests as a 404 from the backend, which can cascade into the [IP tracker](#variable-reference) penalizing the client after a few of them). The shipped `/v1/` entry now uses `^v1/?(.*)$` (optional slash, `*` instead of `+`) to handle all three shapes — `v1`, `v1/`, `v1/foo` — correctly. **If you're running a `routes.toml` from an earlier build of this branch with a `(.+)$`-style pattern, update it** — a bare request to that prefix now forwards differently (to the backend's root) than it did before, which is itself a behavior change worth testing before you roll it out.
+>
+> The static `apython_lb()` decorator's own `/v1/` example (below, under [URL rewrite](#url-rewrite)) does **not** need this change — it registers its own dedicated `@app.route("/v1/", defaults={"path": ""})` rule, which supplies an empty path directly for the bare-prefix case regardless of what the regex does. That per-route `defaults=` mechanism doesn't exist for the one shared dynamic dispatcher, which is why `routes.toml` entries need a regex that explicitly handles it.
+
+**Hot reload**: the file is re-read whenever its mtime changes, polled every
+`CONFIG_POLL_INTERVAL` seconds (the same interval `BackendManager` already
+polls backend configs with) — editing a mounted file takes effect with no
+restart. A bad edit (invalid `route_policy`, unparseable `url_match`, a
+`path` missing its trailing slash, a duplicate `path`, …) is rejected and
+logged; the *previously loaded, valid* table keeps serving traffic rather
+than the app falling over on a typo. At startup, though, a missing or
+invalid `routes.toml` fails loud — the app won't come up silently unrouted.
+
+**Overriding the default file**: the image bakes in `routes.toml` from this
+repo (same pattern as `MODSECURITY_RULES_FILE`/`modsecurity.conf`) —
+reproducing the two routes above out of the box. Point `ROUTE_CONFIG_FILE`
+at a different path and mount your own file there to change it — a Docker
+volume locally, or a Kubernetes `ConfigMap` mounted into the pod, which
+`kubelet` keeps in sync with the file on disk automatically.
+
+**Static, code-defined routes are still supported, and coexist with `routes.toml`** —
+`apython_lb()` (the original decorator, still in `decorators/apython_lb.py`)
+takes `backend_name`/`route_policy`/`url_match`/`url_rewrite` as decorator
+kwargs instead of resolving them from `routes.toml`, for anyone who'd rather
+wire a specific route in code. See [URL rewrite](#url-rewrite) for an
+example. Register one alongside the generic dynamic dispatcher and both work
+at once — confirmed directly, not just assumed: Werkzeug ranks routes by
+specificity, not registration order, so a static route at a more specific
+path (e.g. `/special/<path:path>`) is always tried before the fully-generic
+`/<path:path>` dynamic catch-all, regardless of where either is registered.
+
+One real gotcha from that: if a static route's path **overlaps** with a
+`routes.toml` entry (the same path, or a prefix of it), the static route
+always wins for any URL it matches — Werkzeug never reaches `dynamic_route`
+for those requests at all. `RouteManager` has no visibility into the static
+side of the app, so an overlapping `routes.toml` entry isn't an error, it's
+just silently unreachable for that URL space. Keep static routes and
+`routes.toml` entries on non-overlapping paths unless shadowing part of a
+dynamic entry is actually what you want.
+
+There's no REST API for routes yet (unlike backend configs' `/v1/manage/configs`) — that's a planned follow-up; `routes.toml` is the only way to configure routing today.
+
 ## Variable Reference
 
 | Variable | Default | Description |
@@ -121,7 +215,8 @@ flowchart TD
 | `MANAGE_BASIC_AUTH` | *(unset)* | Optional `user:password` for HTTP Basic auth on the management UI, `/ws/configs`, and `/metrics`, on top of the internal-IP restriction. Set it in any deployment where the internal network is not fully trusted |
 | `MAX_CONTENT_LENGTH` | `16777216` | Maximum request body size in bytes (bodies are buffered in memory for WAF inspection and forwarding) |
 | `HEALTH_CHECK_INTERVAL` | `60` | How often (seconds) backends are health-checked. A backend is healthy only when it answers `GET /` with HTTP **200** (see [Health checks](#health-checks)) |
-| `CONFIG_POLL_INTERVAL` | `10` | How often (seconds) the DB is polled for config changes |
+| `CONFIG_POLL_INTERVAL` | `10` | How often (seconds) the DB is polled for backend config changes, and `routes.toml` for route changes (see [Dynamic route configuration](#dynamic-route-configuration)) |
+| `ROUTE_CONFIG_FILE` | `/app/routes.toml` | Path to the dynamic route config file — see [Dynamic route configuration](#dynamic-route-configuration) |
 | `METRICS_HISTORY_INTERVAL` | `5` | How often (seconds) the management UI's metrics sparklines are sampled — see [Metrics dashboard](#metrics-dashboard) |
 | `METRICS_HISTORY_POINTS` | `180` | How many samples of history each metrics sparkline keeps (default: ~15 minutes at the 5s interval default) |
 | `DNS_NAMESERVERS` | `8.8.8.8,1.1.1.1` | Comma-separated DNS nameservers for backend hostname resolution (the Docker image sets `1.1.1.1`) |
@@ -379,6 +474,11 @@ kubectl rollout restart deployment/apython-lb deployment/apython-lb-test --names
 ## Examples
 
 ### Rate limiting
+The examples below use the static `@apython_lb` decorator (see
+[Dynamic route configuration](#dynamic-route-configuration) for the
+`routes.toml` alternative) because per-route rate-limit overrides are a
+code-only feature for now — the dynamic table applies one app-wide limit
+(`RATE_LIMIT_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`) to every route in it.
 ```python
 # Use the app-wide limiter (RATE_LIMIT_REQUESTS / RATE_LIMIT_WINDOW_SECONDS)
 @app.route("/<path:path>", methods=["GET", "POST"])
@@ -396,6 +496,24 @@ def api_proxy(path): pass
 Rejected requests get a `429` with a `Retry-After` header.
 
 ### URL rewrite
+The equivalent `routes.toml` entry for the common case (strip a `/v1`
+prefix before forwarding). Note the `?` and `*` — this needs to match a bare
+`/v1` or `/v1/` request too, not just `/v1/something`; see the warning in
+[Dynamic route configuration](#dynamic-route-configuration) for why:
+```toml
+[[routes]]
+path = "/v1/"
+backend_name = "my_backend"
+route_policy = "sticky_ip"
+url_match = '^v1/?(.*)$'
+url_rewrite = '\1'
+```
+
+The same thing with the static decorator, and two more rewrite patterns —
+useful if you want a specific route wired up in code rather than in
+`routes.toml`. This one doesn't need the `?`/`*` treatment above: its own
+dedicated `defaults={"path": ""}` rule already supplies an empty path for
+the bare-`/v1/`-or-`/v1` case directly, independent of what `url_match` does:
 ```python
 # Strip a /v1 prefix before forwarding
 @app.route("/v1/", defaults={"path": ""})
@@ -570,6 +688,9 @@ python3 -m pytest -q tests
 ```
 
 ## Releases
+
+See [CHANGELOG.md](CHANGELOG.md) for what's changed since the last tag,
+including any breaking changes — check it before upgrading.
 
 Releases are cut by pushing a semver tag. The `release` GitHub Actions
 workflow ([.github/workflows/release.yml](.github/workflows/release.yml))

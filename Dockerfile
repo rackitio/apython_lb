@@ -35,6 +35,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV MODSECURITY_ENABLED=true
 ENV MODSECURITY_RULES_FILE=/app/modsecurity.conf
 
+# Dynamic route config (classes/route_manager.py) -- same mount-or-bake
+# pattern as MODSECURITY_RULES_FILE above: a default routes.toml ships in the
+# image (COPY . . below), override by mounting a different file (Docker
+# volume or k8s ConfigMap) at this same path.
+ENV ROUTE_CONFIG_FILE=/app/routes.toml
+
 COPY requirements.txt requirements-dev.txt .
 
 # aioquic and pylsqpack (hypercorn's HTTP/3 stack) both hard-code Python's
