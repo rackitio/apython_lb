@@ -137,7 +137,9 @@ url_match = '^v1/?(.*)$'
 url_rewrite = '\1'
 methods = ["GET", "POST"]
 
-# Not part of the shipped default -- an example of restricting methods, e.g.
+# This entry itself isn't part of the shipped default -- only "/" and
+# "/v1/" above are. It's here to show `methods` narrowed to something
+# other than the ["GET", "POST"] default shown on both entries above, e.g.
 # a read-only path that should 405 on anything but GET.
 [[routes]]
 path = "/reports/"

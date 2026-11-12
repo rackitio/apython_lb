@@ -161,6 +161,18 @@ async def _record_request_metrics(response):
 _PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
+# The "/" below and routes.toml's own `path = "/"` entry are two different
+# things that happen to share a spelling, not a duplicate or redundant
+# route:
+#   - This "/" is Werkzeug plumbing. <path:path> alone never matches a bare
+#     "/" request (its converter requires at least one non-slash
+#     character), so defaults={"path": ""} is the standard idiom to cover
+#     that gap -- both rules below call the exact same proxy() function.
+#     This line doesn't know or care what's in routes.toml.
+#   - routes.toml's "/" is the actual routing decision: the least-specific
+#     (catch-all) entry RouteManager.match() falls back to once a request
+#     has already reached dynamic_route, when nothing more specific (like
+#     "/v1/") claims the path. Exactly nginx's `location /` block.
 @app.route("/", defaults={"path": ""}, methods=_PROXY_METHODS, endpoint="proxy")
 @app.route("/<path:path>", methods=_PROXY_METHODS, endpoint="proxy")
 @rate_limit
