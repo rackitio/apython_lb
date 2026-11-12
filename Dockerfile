@@ -5,7 +5,7 @@
 # X.Y.Z tag rather than pythont's stable/latest/X.Y channels, which move
 # and can jump a minor version out from under this image without warning
 # -- see pythont's README for the tag policy.
-FROM rackitio/pythont:3.15.0 AS base
+FROM rackitio/pythont:3.15.2 AS base
 
 ENV SQLITE_DB=/app/data/apython_lb.db
 ENV DNS_NAMESERVERS="1.1.1.1"
