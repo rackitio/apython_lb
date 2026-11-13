@@ -5,7 +5,7 @@
 # X.Y.Z tag rather than pythont's stable/latest/X.Y channels, which move
 # and can jump a minor version out from under this image without warning
 # -- see pythont's README for the tag policy.
-FROM rackitio/pythont:3.15.0 AS base
+FROM rackitio/pythont:3.15.2 AS base
 
 ENV SQLITE_DB=/app/data/apython_lb.db
 ENV DNS_NAMESERVERS="1.1.1.1"
@@ -34,6 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV MODSECURITY_ENABLED=true
 ENV MODSECURITY_RULES_FILE=/app/modsecurity.conf
+
+# Dynamic route config (classes/route_manager.py) -- same mount-or-bake
+# pattern as MODSECURITY_RULES_FILE above: a default routes.toml ships in the
+# image (COPY . . below), override by mounting a different file (Docker
+# volume or k8s ConfigMap) at this same path.
+ENV ROUTE_CONFIG_FILE=/app/routes.toml
 
 COPY requirements.txt requirements-dev.txt .
 

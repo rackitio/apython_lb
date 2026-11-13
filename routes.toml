@@ -1,0 +1,62 @@
+# Dynamic route configuration for apython_lb, loaded by classes/route_manager.py.
+#
+# Baked into the image at /app/routes.toml by default (see the Dockerfile),
+# the same way modsecurity.conf is -- override by mounting a different file
+# at the same path (Docker volume, or a Kubernetes ConfigMap) and setting
+# ROUTE_CONFIG_FILE if you move it elsewhere. Changes to the mounted file are
+# picked up automatically within one CONFIG_POLL_INTERVAL (default 10s), no
+# restart needed.
+#
+# Each [[routes]] entry maps a path prefix to a backend pool. The path with
+# the longest matching prefix wins (nginx `location`-block semantics) -- so
+# "/v1/" below is checked before the "/" catch-all for any request under
+# /v1/, regardless of the order the entries are written in.
+#
+# Fields:
+#   path          required. Must start and end with "/" (e.g. "/", "/v1/").
+#   backend_name  required. Must match a backend pool registered via
+#                 POST /v1/manage/configs (see README.md).
+#   route_policy  required. One of: round_robin, sticky_session, sticky_ip.
+#   url_match     optional. nginx-style regex applied to the FULL forwarded
+#                 path, with no leading "/" (e.g. a request to "/v1/foo"
+#                 gives url_match the string "v1/foo") -- `path` above only
+#                 decides which route wins, it does NOT strip anything from
+#                 what url_match sees. If you want to strip a prefix, your
+#                 regex has to match it explicitly and not capture it, the
+#                 same way the "/v1/" entry below does: '^v1/?(.*)$' matches
+#                 "v1/" (or bare "v1", with no trailing slash at all -- see
+#                 next paragraph) at the start, no leading slash, and
+#                 captures only what comes after it. See url_rewrite.
+#
+#                 A request with nothing after the prefix -- "/v1" or "/v1/"
+#                 itself, not "/v1/something" -- still needs its own match:
+#                 raw_path is "v1" or "v1/" in that case, with no trailing
+#                 segment for a plain '^v1/(.+)$' to capture (the `+` means
+#                 "one or more", so zero characters after "v1/" fails to
+#                 match at all, and the path gets forwarded completely
+#                 unrewritten instead -- found the hard way, see PR #9).
+#                 '^v1/?(.*)$' (optional slash, `*` instead of `+`) handles
+#                 all three shapes -- "v1", "v1/", "v1/foo" -- rewriting the
+#                 first two to the backend's own root.
+#   url_rewrite   optional. Replacement for url_match; \1/\g<name> group
+#                 references supported. Only meaningful alongside url_match.
+#   methods       optional. List of HTTP methods this mapping accepts (e.g.
+#                 ["GET"]). Omit to default to ["GET", "POST"] -- shown
+#                 explicitly below so every available field is visible in
+#                 this default file, even where it's just the default value.
+#                 A request whose method isn't in this list gets a 405 with
+#                 an Allow header, not a silent fallthrough to another route.
+
+[[routes]]
+path = "/"
+backend_name = "my_backend"
+route_policy = "round_robin"
+methods = ["GET", "POST"]
+
+[[routes]]
+path = "/v1/"
+backend_name = "dns_backend"
+route_policy = "sticky_ip"
+url_match = '^v1/?(.*)$'
+url_rewrite = '\1'
+methods = ["GET", "POST"]

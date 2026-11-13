@@ -8,6 +8,11 @@ environment variables read once at import time.
 
 import os
 
+# Shared with classes/route_manager.py: both decorator-time (static
+# @apython_lb kwargs) and load-time (dynamic routes.toml entries) validation
+# need the same set of valid route_policy values.
+VALID_POLICIES = {"round_robin", "sticky_session", "sticky_ip"}
+
 # ── Retry / circuit-breaker tunables ──────────────────────────────────── #
 LB_MAX_ATTEMPTS = int(os.environ.get("LB_MAX_ATTEMPTS", 3))  # total tries per request
 
