@@ -52,6 +52,16 @@ history.
   Pushed to every connected admin session over the existing `/ws/configs`
   WebSocket on the sampler's own interval.
   ([#10](https://github.com/rackitio/apython_lb/pull/10))
+- **Programmable route API**: routes can now be created and removed live,
+  via `POST`/`DELETE /v1/manage/routes` or a new "Add Route"/"Routes"
+  section on the `/v1/manage` dashboard — `routes.toml` is no longer the
+  only way to configure routing. API-created routes persist in the same
+  SQLite database backend configs already use, and are polled/broadcast
+  the same way. A path can only be defined by one source (file or API) at
+  a time — creating a route at a path either source already owns is
+  rejected outright, and `routes.toml`-sourced routes stay read-only from
+  the API/UI's side (nothing writes back to the file).
+  ([#11](https://github.com/rackitio/apython_lb/pull/11))
 
 ### Fixed
 

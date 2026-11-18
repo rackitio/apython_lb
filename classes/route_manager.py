@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import tomllib
 
 from lb_settings import VALID_POLICIES
+from modules.broadcast import broadcast_route_update
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +29,16 @@ class RouteEntry:
     url_match: str | None = None
     url_rewrite: str | None = None
     methods: frozenset[str] = field(default_factory=lambda: _DEFAULT_METHODS)
+    # Provenance only -- match() doesn't care which source an entry came from.
+    # "file" entries are read-only from the API/UI's perspective (nothing
+    # ever writes back to routes.toml); "db" entries are the ones the REST
+    # API and admin UI can create/delete. db_id is the Routes table row id,
+    # set only for source="db".
+    source: str = "file"
+    db_id: int | None = None
 
 
-def _validate_entry(raw: dict) -> RouteEntry:
+def _validate_entry(raw: dict, source: str = "file", db_id: int | None = None) -> RouteEntry:
     path = raw.get("path")
     if not isinstance(path, str) or not path.startswith("/") or not path.endswith("/"):
         raise ValueError(
@@ -80,6 +88,8 @@ def _validate_entry(raw: dict) -> RouteEntry:
         url_match=url_match,
         url_rewrite=raw.get("url_rewrite"),
         methods=methods,
+        source=source,
+        db_id=db_id,
     )
 
 
@@ -107,38 +117,135 @@ def _load_entries(file_path: str) -> list[RouteEntry]:
 class RouteManager:
     """
     In-memory table of dynamic route mappings (path -> backend_name/
-    route_policy/url_match/url_rewrite/methods), loaded from a TOML file and
-    hot-reloaded whenever that file's mtime changes -- so a mounted Docker
-    volume or Kubernetes ConfigMap edit takes effect without a pod restart.
+    route_policy/url_match/url_rewrite/methods), merged from two sources:
 
-    Mirrors BackendManager's own poll-and-reconcile shape (classes/
-    backend_manager.py) so a future SQLite-backed source can be added
-    alongside this one later without changing how callers use match().
+    - `routes.toml` (ROUTE_CONFIG_FILE), hot-reloaded whenever its mtime
+      changes -- a mounted Docker volume or Kubernetes ConfigMap edit takes
+      effect without a pod restart. Read-only from this class's own
+      perspective: nothing here ever writes back to the file.
+    - A `db` (AsyncDb), if one is given -- routes created/removed live via
+      the `/v1/manage/routes` REST API, persisted in SQLite the same way
+      backend configs already are. Polled on the same interval as the file.
+
+    A path may only be defined by one source at a time -- see
+    validate_new_path() (checked by the REST layer before insert) and the
+    collision check in load_now() (checked when the file is reloaded,
+    in case it's since been edited to claim a path an API-created route
+    already owns).
     """
 
     def __init__(
         self,
         file_path: str = ROUTE_CONFIG_FILE,
         poll_interval: int = CONFIG_POLL_INTERVAL,
+        db=None,
     ):
         self.file_path = file_path
         self.poll_interval = poll_interval
+        self.db = db
+        self._file_entries: list[RouteEntry] = []
+        self._db_entries: list[RouteEntry] = []
         self._entries: list[RouteEntry] = []
         self._mtime: float | None = None
+        self._db_rows_seen: list[dict] | None = None
+
+    def _rebuild(self) -> None:
+        """Merge file + DB entries into the single table match() reads from,
+        longest-path first (unchanged ordering rule from Phase 1)."""
+        merged = list(self._file_entries) + list(self._db_entries)
+        merged.sort(key=lambda e: len(e.path), reverse=True)
+        self._entries = merged
 
     def load_now(self) -> None:
         """
-        Load (or reload) entries from disk. Raises on any invalid entry or a
-        missing/empty file -- fail loud rather than silently serve a stale or
-        partial route table. Call this once, synchronously, during app
-        startup (before the app accepts its first request) so there's no
-        window where routes are configured but not yet loaded; start() below
-        only handles reloading after that.
+        Load (or reload) file entries from disk. Raises on any invalid
+        entry, a missing/empty file, or a path that collides with an
+        already-loaded DB-sourced route -- fail loud rather than silently
+        serve a stale or partial route table. Call this once, synchronously,
+        during app startup (before the app accepts its first request) so
+        there's no window where routes are configured but not yet loaded;
+        start() below only handles reloading after that.
         """
         entries = _load_entries(self.file_path)
-        self._entries = entries
+
+        collisions = {e.path for e in entries} & {e.path for e in self._db_entries}
+        if collisions:
+            raise ValueError(
+                f"{self.file_path!r} path(s) {sorted(collisions)} collide with an "
+                "existing API-created route -- remove the API-created route first, "
+                "or use a different path in routes.toml"
+            )
+
+        self._file_entries = entries
         self._mtime = os.stat(self.file_path).st_mtime
+        self._rebuild()
         logger.debug(f"Loaded {len(entries)} route(s) from {self.file_path!r}")
+
+    async def reload_db(self) -> bool:
+        """
+        Fetch the current DB-sourced routes and merge them in. Returns True
+        if anything changed (a route was added/removed since the last call),
+        so callers know whether to broadcast. A no-op if this manager wasn't
+        given a `db`. Call once at startup (awaited, after load_now()) and
+        thereafter from the poll loop in start().
+
+        A DB row that fails validation, or collides with a file-sourced
+        path, is logged and skipped -- same "keep serving what's still
+        valid" behavior load_now() already has for a bad file edit. Neither
+        should happen in practice since the REST layer checks both before
+        insert; this is a defensive backstop, not the primary guard.
+        """
+        if self.db is None:
+            return False
+
+        rows = await self.db.get_all_routes()
+        if rows == self._db_rows_seen:
+            return False
+
+        file_paths = {e.path for e in self._file_entries}
+        entries = []
+        for row in rows:
+            try:
+                entry = _validate_entry(row, source="db", db_id=row["id"])
+            except ValueError as exc:
+                logger.error(f"Skipping invalid DB route {row.get('path')!r}: {exc}")
+                continue
+            if entry.path in file_paths:
+                logger.error(f"Skipping DB route {entry.path!r}: collides with a routes.toml entry")
+                continue
+            entries.append(entry)
+
+        self._db_entries = entries
+        self._db_rows_seen = rows
+        self._rebuild()
+        return True
+
+    def validate_entry(self, raw: dict) -> RouteEntry:
+        """Validate a dict of route fields (same shape as a routes.toml
+        entry or a DB row) without adding it anywhere -- used by the REST
+        endpoint to check a submitted route before inserting it."""
+        return _validate_entry(raw)
+
+    def validate_new_path(self, path: str) -> None:
+        """Raise ValueError if `path` already exists in the merged table
+        (file- or DB-sourced). Called by the REST endpoint before insert --
+        this is the actual collision guard; the Routes table's UNIQUE
+        constraint on Path is defense-in-depth for a concurrent-insert race,
+        not the primary check (it wouldn't catch a collision with a
+        file-sourced path at all)."""
+        for entry in self._entries:
+            if entry.path == path:
+                raise ValueError(
+                    f"Route path {path!r} already exists (source: {entry.source}) -- "
+                    "pick a different path, or remove the existing route first"
+                )
+
+    def list_entries(self) -> list[RouteEntry]:
+        """All currently loaded routes, file- and DB-sourced, longest-path
+        first -- for the admin UI/REST layer to render. match() reads
+        self._entries directly; this is just a read-only view of the same
+        list for callers outside this class."""
+        return list(self._entries)
 
     def match(self, request_path: str, method: str) -> tuple[RouteEntry | None, bool]:
         """
@@ -165,14 +272,28 @@ class RouteManager:
         return None, False
 
     async def start(self):
-        """Background loop: reload whenever the file's mtime changes. Does
-        NOT perform the initial load -- call load_now() yourself first."""
+        """Background loop: reload whenever the file's mtime changes or the
+        DB-sourced routes change, broadcasting to the admin UI on either.
+        Does NOT perform the initial load -- call load_now() (and, if a db
+        was given, await reload_db() once) yourself first."""
         while True:
             await asyncio.sleep(self.poll_interval)
+            changed = False
+
             try:
                 mtime = os.stat(self.file_path).st_mtime
                 if mtime != self._mtime:
                     logger.debug(f"{self.file_path!r} changed on disk, reloading routes")
                     self.load_now()
+                    changed = True
             except Exception as exc:
                 logger.error(f"Failed to reload routes from {self.file_path!r}: {exc}")
+
+            try:
+                if await self.reload_db():
+                    changed = True
+            except Exception as exc:
+                logger.error(f"Failed to reload DB-sourced routes: {exc}")
+
+            if changed:
+                await broadcast_route_update()

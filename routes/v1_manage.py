@@ -1,8 +1,9 @@
+import aiosqlite
 from quart import Blueprint, current_app, render_template_string, request
 
 from classes import AsyncDb
 from decorators import ip_restriction
-from templates import CONFIG_WS_TEMPLATE, METRICS_PANEL_TEMPLATE
+from templates import CONFIG_WS_TEMPLATE, METRICS_PANEL_TEMPLATE, ROUTE_LIST_TEMPLATE
 
 db = AsyncDb()
 
@@ -52,12 +53,16 @@ async def index():
     metrics_html = await render_template_string(
         METRICS_PANEL_TEMPLATE, groups=current_app.metrics_history.render_panels()
     )
+    route_html = await render_template_string(
+        ROUTE_LIST_TEMPLATE, routes=current_app.route_manager.list_entries()
+    )
     return await render_template_string(
         CONFIG_WS_TEMPLATE,
         configs=configs,
         backends=backends,
         rate_limit_html=rate_limit_html,
         metrics_html=metrics_html,
+        route_html=route_html,
     )
 
 
@@ -109,4 +114,73 @@ async def delete_config(config_id):
 
     # HTMX out-of-band swap handles the list refresh via the broadcast;
     # return empty 200 so HTMX doesn't try to swap the trigger element
+    return "", 200
+
+
+@v1_manage.route("/v1/manage/routes", methods=["POST"])
+@ip_restriction.internal_only
+async def create_route():
+    data = await request.get_json()
+
+    path = data.get("path")
+    backend_name = data.get("backend_name")
+    route_policy = data.get("route_policy")
+    url_match = data.get("url_match") or None
+    url_rewrite = data.get("url_rewrite") or None
+    methods_raw = data.get("methods")  # comma/space-separated string, optional
+
+    if not all([path, backend_name, route_policy]):
+        return '<span style="color:red">✗ Missing required fields</span>', 400
+
+    methods = None
+    if methods_raw:
+        methods = [m for m in methods_raw.replace(",", " ").split() if m]
+
+    route_manager = current_app.route_manager
+    try:
+        entry = route_manager.validate_entry(
+            {
+                "path": path,
+                "backend_name": backend_name,
+                "route_policy": route_policy,
+                "url_match": url_match,
+                "url_rewrite": url_rewrite,
+                "methods": methods,
+            }
+        )
+        route_manager.validate_new_path(entry.path)
+    except ValueError as exc:
+        return f'<span style="color:red">✗ {exc}</span>', 400
+
+    try:
+        await db.insert_route(
+            entry.path,
+            entry.backend_name,
+            entry.route_policy,
+            entry.url_match,
+            entry.url_rewrite,
+            sorted(entry.methods),
+        )
+    except aiosqlite.IntegrityError:
+        # Only reachable via a race against another insert of the same path
+        # between validate_new_path() above and this insert -- the Routes
+        # table's UNIQUE constraint is the backstop for that window.
+        return '<span style="color:red">✗ Route path already exists</span>', 400
+
+    # The poll loop will pick up the new row and broadcast it, same as
+    # create_config above:
+    # await broadcast_route_update()
+
+    return '<span style="color:green">✓ Route saved</span>', 201
+
+
+@v1_manage.route("/v1/manage/routes/<int:route_id>", methods=["DELETE"])
+@ip_restriction.internal_only
+async def delete_route(route_id):
+    await db.delete_route(route_id)
+
+    # Same reasoning as delete_config above -- let the poll loop detect the
+    # removal and broadcast.
+    # await broadcast_route_update()
+
     return "", 200

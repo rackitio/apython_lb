@@ -19,6 +19,7 @@ CONFIG_WS_TEMPLATE = """
                       border: 1px solid red; background: none; border-radius: 4px; }
         .btn-select { font-size: 0.75rem; padding: 2px 8px; cursor: pointer; color: #2a9d2a;
                       border: 1px solid #2a9d2a; background: none; border-radius: 4px; }
+        .route-source { font-size: 0.78rem; color: #999; font-style: italic; }
         .rate-limit-config { margin: 4px 0 10px; }
         .rate-table { border-collapse: collapse; width: 100%; max-width: 600px; }
         .rate-table th, .rate-table td { padding: 4px 10px; text-align: left; border-bottom: 1px solid #eee; }
@@ -45,7 +46,7 @@ CONFIG_WS_TEMPLATE = """
 </head>
 <!-- ws-connect established on body so wsSend() can reach it via htmx internals -->
 <body hx-ext="ws" ws-connect="/ws/configs">
-    <h3>Add Config</h3>
+    <h3>Add Backend</h3>
     <div class="config-form">
         <form hx-ext="json-enc"
               hx-post="/v1/manage/configs"
@@ -62,7 +63,7 @@ CONFIG_WS_TEMPLATE = """
         <div id="form-status"></div>
     </div>
 
-    <h3>Saved Configs</h3>
+    <h3>Backends</h3>
     <div id="config-list">
         {% for config in configs %}
         <details>
@@ -104,6 +105,33 @@ CONFIG_WS_TEMPLATE = """
         </details>
         {% endfor %}
     </div>
+
+    <h3>Add Route</h3>
+    <div class="config-form">
+        <form hx-ext="json-enc"
+              hx-post="/v1/manage/routes"
+              hx-target="#route-form-status"
+              hx-swap="innerHTML"
+              hx-on::after-request="this.reset()">
+            <label>Path:          <input type="text" name="path"         placeholder="/v2/"         required></label>
+            <label>Backend name:  <input type="text" name="backend_name" placeholder="my_backend"   required></label>
+            <label>Route policy:
+                <select name="route_policy" required>
+                    <option value="round_robin">round_robin</option>
+                    <option value="sticky_session">sticky_session</option>
+                    <option value="sticky_ip">sticky_ip</option>
+                </select>
+            </label>
+            <label>URL match (optional, regex):   <input type="text" name="url_match"   placeholder="^v2/?(.*)$"></label>
+            <label>URL rewrite (optional):         <input type="text" name="url_rewrite" placeholder="\\1"></label>
+            <label>Methods (optional, default GET+POST): <input type="text" name="methods" placeholder="GET,POST"></label>
+            <button type="submit">Save</button>
+        </form>
+        <div id="route-form-status"></div>
+    </div>
+
+    <h3>Routes</h3>
+    {{ route_html | safe }}
 
     <h3>Rate Limited IPs</h3>
     <button class="btn-refresh"

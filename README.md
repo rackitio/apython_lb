@@ -201,7 +201,45 @@ just silently unreachable for that URL space. Keep static routes and
 `routes.toml` entries on non-overlapping paths unless shadowing part of a
 dynamic entry is actually what you want.
 
-There's no REST API for routes yet (unlike backend configs' `/v1/manage/configs`) — that's a planned follow-up; `routes.toml` is the only way to configure routing today.
+**Routes can also be managed live, through the API or the `/v1/manage` dashboard** — `routes.toml` isn't the only way to configure routing. Routes created this way are stored in the same SQLite database backend configs already use (`SQLITE_DB`), so they persist across restarts and are visible to every worker via the same poll loop that already watches `routes.toml`.
+
+```bash
+curl -X POST https://your-host/v1/manage/routes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "path": "/v2/",
+    "backend_name": "v2_backend",
+    "route_policy": "round_robin",
+    "url_match": "^v2/?(.*)$",
+    "url_rewrite": "\\1",
+    "methods": "GET,POST"
+  }'
+
+curl -X DELETE https://your-host/v1/manage/routes/1
+```
+
+`path`, `backend_name`, and `route_policy` are required; `url_match`/
+`url_rewrite`/`methods` are optional, same meaning as the `routes.toml`
+fields above (`methods` is a comma-separated string here, e.g. `"GET,POST"`
+— omit it for the same `GET`+`POST` default). Both endpoints are
+`internal_only` like every other `/v1/manage/*` route.
+
+**A route's path can only be defined by one source at a time.** Creating a
+route at a path that's already covered — by an existing `routes.toml`
+entry *or* another API-created route — is rejected outright with a clear
+error, rather than silently overriding or shadowing it. There's no
+precedence rule to reason about between the two sources: a path is either
+free or it isn't. The reverse direction is covered too — if `routes.toml`
+is edited to add a path an API-created route already owns, that reload is
+rejected the same way a bad file edit always has been (logged, previous
+valid table keeps serving).
+
+API-created routes are also **frozen from `routes.toml`'s side**: nothing
+in this app ever writes back to the file. The admin UI reflects this —
+routes it rendered from the file show no remove button at all (labelled
+"from routes.toml"); only API-created routes get one. To change or remove
+a `routes.toml`-sourced route, edit the file (or the mounted ConfigMap)
+directly, same as before this existed.
 
 ## Variable Reference
 

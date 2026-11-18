@@ -1,9 +1,21 @@
 import asyncio
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
 from classes.route_manager import RouteEntry, RouteManager, _load_entries
+
+
+class FakeDb:
+    """Minimal stand-in for AsyncDb -- RouteManager only ever calls
+    get_all_routes() on it."""
+
+    def __init__(self, rows=None):
+        self.rows = rows or []
+
+    async def get_all_routes(self):
+        return self.rows
 
 
 def write_toml(path, content: str):
@@ -254,9 +266,16 @@ def test_load_now_picks_up_file_changes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_reloads_in_the_background_on_mtime_change(tmp_path):
+async def test_start_reloads_in_the_background_on_mtime_change(tmp_path, monkeypatch):
     """Exercises the actual poll loop (not just load_now() called by hand) --
-    a short poll_interval so the test doesn't have to wait long."""
+    a short poll_interval so the test doesn't have to wait long.
+
+    start() broadcasts on change, which needs a Quart app context in
+    production (provided by app.add_background_task() -- see main.py) but
+    not here, so the broadcast call itself is mocked out, same convention
+    test_backend_manager.py already uses for its own poll loop."""
+    monkeypatch.setattr("classes.route_manager.broadcast_route_update", AsyncMock())
+
     file_path = tmp_path / "routes.toml"
     write_toml(
         file_path,
@@ -293,3 +312,142 @@ async def test_start_reloads_in_the_background_on_mtime_change(tmp_path):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ── DB-sourced routes (Phase 2) ──────────────────────────────────────────── #
+
+DB_ROW = {
+    "id": 1,
+    "path": "/v2/",
+    "backend_name": "v2_backend",
+    "route_policy": "round_robin",
+    "url_match": None,
+    "url_rewrite": None,
+    "methods": ["GET", "POST"],
+}
+
+
+@pytest.mark.asyncio
+async def test_reload_db_merges_entries_into_match(tmp_path):
+    file_path = write_toml(
+        tmp_path / "routes.toml",
+        """
+        [[routes]]
+        path = "/"
+        backend_name = "root_pool"
+        route_policy = "round_robin"
+        """,
+    )
+    rm = RouteManager(file_path=file_path, db=FakeDb([DB_ROW]))
+    rm.load_now()
+
+    changed = await rm.reload_db()
+    assert changed is True
+
+    entry, allowed = rm.match("/v2/thing", "GET")
+    assert entry.backend_name == "v2_backend"
+    assert entry.source == "db"
+    assert entry.db_id == 1
+    assert allowed
+
+    # Root route from the file is still there, just less specific.
+    assert rm.match("/other", "GET")[0].backend_name == "root_pool"
+
+
+@pytest.mark.asyncio
+async def test_reload_db_returns_false_when_nothing_changed(tmp_path):
+    file_path = write_toml(
+        tmp_path / "routes.toml",
+        """
+        [[routes]]
+        path = "/"
+        backend_name = "root_pool"
+        route_policy = "round_robin"
+        """,
+    )
+    fake_db = FakeDb([DB_ROW])
+    rm = RouteManager(file_path=file_path, db=fake_db)
+    rm.load_now()
+
+    assert await rm.reload_db() is True
+    assert await rm.reload_db() is False  # same rows, nothing to do
+
+    fake_db.rows = []
+    assert await rm.reload_db() is True  # row removed -- change detected
+    assert rm.match("/v2/thing", "GET")[0].backend_name == "root_pool"
+
+
+@pytest.mark.asyncio
+async def test_reload_db_skips_invalid_row_and_keeps_rest(tmp_path):
+    file_path = write_toml(
+        tmp_path / "routes.toml",
+        """
+        [[routes]]
+        path = "/"
+        backend_name = "root_pool"
+        route_policy = "round_robin"
+        """,
+    )
+    bad_row = dict(DB_ROW, id=2, path="/bad/", route_policy="most_requests")
+    rm = RouteManager(file_path=file_path, db=FakeDb([DB_ROW, bad_row]))
+    rm.load_now()
+    await rm.reload_db()
+
+    assert rm.match("/v2/thing", "GET")[0].backend_name == "v2_backend"
+    assert rm.match("/bad/thing", "GET")[0].backend_name == "root_pool"  # skipped
+
+
+@pytest.mark.asyncio
+async def test_reload_db_skips_row_colliding_with_file_path(tmp_path):
+    file_path = write_toml(
+        tmp_path / "routes.toml",
+        """
+        [[routes]]
+        path = "/v2/"
+        backend_name = "file_pool"
+        route_policy = "round_robin"
+        """,
+    )
+    colliding_row = dict(DB_ROW, path="/v2/")
+    rm = RouteManager(file_path=file_path, db=FakeDb([colliding_row]))
+    rm.load_now()
+    await rm.reload_db()
+
+    # The file-sourced entry wins; the colliding DB row never gets merged in.
+    entry, _ = rm.match("/v2/thing", "GET")
+    assert entry.backend_name == "file_pool"
+    assert entry.source == "file"
+
+
+def test_validate_new_path_rejects_existing_file_and_db_paths():
+    rm = RouteManager.__new__(RouteManager)
+    rm._file_entries = [ROOT]
+    rm._db_entries = [
+        RouteEntry(path="/v2/", backend_name="x", route_policy="round_robin", source="db")
+    ]
+    rm._rebuild()
+
+    with pytest.raises(ValueError):
+        rm.validate_new_path("/")
+    with pytest.raises(ValueError):
+        rm.validate_new_path("/v2/")
+    rm.validate_new_path("/v3/")  # free -- no error
+
+
+def test_load_now_rejects_file_path_colliding_with_db_entry(tmp_path):
+    file_path = write_toml(
+        tmp_path / "routes.toml",
+        """
+        [[routes]]
+        path = "/v2/"
+        backend_name = "file_pool"
+        route_policy = "round_robin"
+        """,
+    )
+    rm = RouteManager(file_path=file_path)
+    rm._db_entries = [
+        RouteEntry(path="/v2/", backend_name="x", route_policy="round_robin", source="db")
+    ]
+
+    with pytest.raises(ValueError):
+        rm.load_now()

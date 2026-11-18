@@ -31,6 +31,7 @@ class AsyncDb:
             await self._retry_locked(lambda: self.db.execute("PRAGMA journal_mode=WAL"))
             await self.db.execute("PRAGMA synchronous=NORMAL")
             await self._retry_locked(self.init_db)
+            await self._retry_locked(self.init_routes_table)
 
     @staticmethod
     async def _retry_locked(action, attempts: int = 10, delay: float = 0.3):
@@ -53,6 +54,21 @@ class AsyncDb:
                 Name TEXT,
                 Data TEXT,
                 LastSelected TIMESTAMP
+            )
+        """)
+        await self.db.commit()
+
+    async def init_routes_table(self):
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS Routes (
+                Id INTEGER PRIMARY KEY,
+                Path TEXT UNIQUE,
+                BackendName TEXT,
+                RoutePolicy TEXT,
+                UrlMatch TEXT,
+                UrlRewrite TEXT,
+                Methods TEXT,
+                CreatedAt TIMESTAMP
             )
         """)
         await self.db.commit()
@@ -120,4 +136,62 @@ class AsyncDb:
         """Delete a configuration entry by ID"""
         await self._ensure_initialized()
         await self.db.execute("DELETE FROM MyTable WHERE Id = ?", (config_id,))
+        await self.db.commit()
+
+    async def insert_route(
+        self,
+        path: str,
+        backend_name: str,
+        route_policy: str,
+        url_match: str | None,
+        url_rewrite: str | None,
+        methods: list[str],
+    ):
+        """Insert a dynamic route entry"""
+        await self._ensure_initialized()
+        await self.db.execute(
+            """INSERT INTO Routes
+               (Path, BackendName, RoutePolicy, UrlMatch, UrlRewrite, Methods, CreatedAt)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                path,
+                backend_name,
+                route_policy,
+                url_match,
+                url_rewrite,
+                json.dumps(methods),
+                datetime.now(),
+            ),
+        )
+        await self.db.commit()
+
+    async def get_all_routes(self):
+        """Get all dynamic route entries"""
+        await self._ensure_initialized()
+        cursor = await self.db.execute(
+            """SELECT Id, Path, BackendName, RoutePolicy, UrlMatch, UrlRewrite, Methods, CreatedAt
+               FROM Routes ORDER BY Id"""
+        )
+        rows = await cursor.fetchall()
+
+        routes = []
+        for row in rows:
+            routes.append(
+                {
+                    "id": row["Id"],
+                    "path": row["Path"],
+                    "backend_name": row["BackendName"],
+                    "route_policy": row["RoutePolicy"],
+                    "url_match": row["UrlMatch"],
+                    "url_rewrite": row["UrlRewrite"],
+                    "methods": json.loads(row["Methods"]),
+                    "created_at": row["CreatedAt"],
+                }
+            )
+        return routes
+
+    async def delete_route(self, route_id: int):
+        """Delete a dynamic route entry by ID"""
+        await self._ensure_initialized()
+        await self.db.execute("DELETE FROM Routes WHERE Id = ?", (route_id,))
         await self.db.commit()
