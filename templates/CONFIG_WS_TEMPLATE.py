@@ -46,7 +46,7 @@ CONFIG_WS_TEMPLATE = """
 </head>
 <!-- ws-connect established on body so wsSend() can reach it via htmx internals -->
 <body hx-ext="ws" ws-connect="/ws/configs">
-    <h3>Add Config</h3>
+    <h3>Add Backend</h3>
     <div class="config-form">
         <form hx-ext="json-enc"
               hx-post="/v1/manage/configs"
@@ -63,7 +63,7 @@ CONFIG_WS_TEMPLATE = """
         <div id="form-status"></div>
     </div>
 
-    <h3>Saved Configs</h3>
+    <h3>Backends</h3>
     <div id="config-list">
         {% for config in configs %}
         <details>
