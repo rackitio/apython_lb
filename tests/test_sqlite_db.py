@@ -49,3 +49,41 @@ async def test_get_all_configs_orders_most_recently_selected_first(tmp_path: Pat
     assert [c["name"] for c in configs] == ["first", "second"]
 
     await db.db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_db_route_crud_operations(tmp_path: Path):
+    db = AsyncDb(str(tmp_path / "test.db"))
+    await db.initialize()
+
+    await db.insert_route("/v2/", "v2_backend", "round_robin", "^v2/?(.*)$", r"\1", ["GET", "POST"])
+    routes = await db.get_all_routes()
+
+    assert len(routes) == 1
+    assert routes[0]["path"] == "/v2/"
+    assert routes[0]["backend_name"] == "v2_backend"
+    assert routes[0]["route_policy"] == "round_robin"
+    assert routes[0]["url_match"] == "^v2/?(.*)$"
+    assert routes[0]["url_rewrite"] == r"\1"
+    assert routes[0]["methods"] == ["GET", "POST"]
+
+    await db.delete_route(routes[0]["id"])
+    assert await db.get_all_routes() == []
+
+    await db.db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_db_insert_route_rejects_duplicate_path(tmp_path: Path):
+    """The Routes table's UNIQUE constraint on Path is the defense-in-depth
+    backstop behind RouteManager.validate_new_path()'s own check."""
+    import aiosqlite
+
+    db = AsyncDb(str(tmp_path / "test.db"))
+    await db.initialize()
+
+    await db.insert_route("/v2/", "v2_backend", "round_robin", None, None, ["GET"])
+    with pytest.raises(aiosqlite.IntegrityError):
+        await db.insert_route("/v2/", "other_backend", "round_robin", None, None, ["GET"])
+
+    await db.db.close()

@@ -37,7 +37,7 @@ app = Quart(__name__)
 db = AsyncDb()
 backend_manager = BackendManager(db)
 app.backend_manager = backend_manager
-route_manager = RouteManager()
+route_manager = RouteManager(db=db)
 app.route_manager = route_manager
 app.ip_tracker = IPTracker(
     threshold=int(os.environ.get("IP_TRACKER_404_THRESHOLD", 4)),
@@ -89,8 +89,11 @@ async def startup():
     # Loaded synchronously (and fail loud if routes.toml is missing/invalid)
     # so the route table is populated before the app accepts its first
     # request -- route_manager.start() below only handles reloading after
-    # this, not the initial load.
+    # this, not the initial load. reload_db() is awaited here too (db is
+    # already initialized above) so API-created routes are live from the
+    # first request as well, not just after the first poll tick.
     route_manager.load_now()
+    await route_manager.reload_db()
     app.add_background_task(route_manager.start)
 
 

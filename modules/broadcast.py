@@ -3,7 +3,12 @@ import logging
 from quart import current_app, render_template_string
 
 from classes import AsyncDb
-from templates import ACTIVE_BACKENDS_TEMPLATE, CONFIG_LIST_TEMPLATE, METRICS_PANEL_TEMPLATE
+from templates import (
+    ACTIVE_BACKENDS_TEMPLATE,
+    CONFIG_LIST_TEMPLATE,
+    METRICS_PANEL_TEMPLATE,
+    ROUTE_LIST_TEMPLATE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,27 @@ async def broadcast_config_update():
             logger.debug(
                 f"[broadcast] Removed stale client, {len(connected_clients) - len(disconnected)} remaining."
             )
+
+    connected_clients.difference_update(disconnected)
+
+
+async def broadcast_route_update():
+    """
+    Broadcast the current merged route table (routes.toml + API-created
+    routes) to every connected admin session. Called by RouteManager's own
+    poll loop (classes/route_manager.py) when either source changes --
+    mirrors broadcast_config_update()'s event-triggered shape above, just
+    for routes instead of backend configs.
+    """
+    routes = current_app.route_manager.list_entries()
+    payload = await render_template_string(ROUTE_LIST_TEMPLATE, routes=routes)
+
+    disconnected = set()
+    for client in connected_clients:
+        try:
+            await client.send(payload)
+        except Exception:
+            disconnected.add(client)
 
     connected_clients.difference_update(disconnected)
 
