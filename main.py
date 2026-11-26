@@ -10,6 +10,7 @@ from quart import Quart, Response, request
 from classes import (
     AsyncDb,
     BackendManager,
+    ConfigFile,
     IPTracker,
     MetricsHistory,
     ModSecurityEngine,
@@ -35,9 +36,13 @@ configure_logging()
 
 app = Quart(__name__)
 db = AsyncDb()
-backend_manager = BackendManager(db)
+# One reader for apython_lb.toml, shared by both managers so the file is
+# parsed once per change and they can never see different versions of it.
+config_file = ConfigFile()
+app.config_file = config_file
+backend_manager = BackendManager(db, config_file=config_file)
 app.backend_manager = backend_manager
-route_manager = RouteManager(db=db)
+route_manager = RouteManager(config_file=config_file, db=db)
 app.route_manager = route_manager
 app.ip_tracker = IPTracker(
     threshold=int(os.environ.get("IP_TRACKER_404_THRESHOLD", 4)),

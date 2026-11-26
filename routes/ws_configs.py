@@ -39,7 +39,7 @@ async def index():
     try:
         # Send full current state on connect/reconnect so the client is
         # immediately up to date regardless of when they (re)connected.
-        configs = await db.get_all_configs()
+        configs = current_app.backend_manager.list_configs(await db.get_all_configs())
 
         backends = []
         for name, rr in current_app.backend_manager._backends.items():

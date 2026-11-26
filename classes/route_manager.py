@@ -4,10 +4,10 @@ import os
 import re
 from dataclasses import dataclass, field
 
-import tomllib
-
 from lb_settings import VALID_POLICIES
 from modules.broadcast import broadcast_route_update
+
+from .config_file import ConfigFile
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 # source with -- one "how often do we notice config changed" setting for the
 # whole app, not a second env var that means almost the same thing.
 CONFIG_POLL_INTERVAL = int(os.environ.get("CONFIG_POLL_INTERVAL", 10))  # seconds
-ROUTE_CONFIG_FILE = os.environ.get("ROUTE_CONFIG_FILE", "/app/routes.toml")
 
 _VALID_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 _DEFAULT_METHODS = frozenset({"GET", "POST"})
@@ -93,19 +92,19 @@ def _validate_entry(raw: dict, source: str = "file", db_id: int | None = None) -
     )
 
 
-def _load_entries(file_path: str) -> list[RouteEntry]:
-    with open(file_path, "rb") as f:
-        data = tomllib.load(f)
-
-    raw_routes = data.get("routes", [])
-    if not raw_routes:
-        raise ValueError(f"No [[routes]] entries found in {file_path!r}")
-
+def _entries_from_raw(raw_routes: list[dict], source: str) -> list[RouteEntry]:
+    """
+    Validate the raw [[routes]] tables ConfigFile parsed out of the config
+    file. A file with no [[routes]] at all is legitimate now that routes
+    can also come from the REST API, so an empty list is returned rather
+    than raised on -- ConfigFile itself refuses a file with no recognised
+    sections at all.
+    """
     entries = [_validate_entry(raw) for raw in raw_routes]
 
     duplicates = {e.path for e in entries if sum(1 for o in entries if o.path == e.path) > 1}
     if duplicates:
-        raise ValueError(f"Duplicate route path(s) in {file_path!r}: {sorted(duplicates)}")
+        raise ValueError(f"Duplicate route path(s) in {source!r}: {sorted(duplicates)}")
 
     # Longest path first so match() can do a simple linear scan and return on
     # the first hit -- the most specific prefix is always checked before any
@@ -119,9 +118,10 @@ class RouteManager:
     In-memory table of dynamic route mappings (path -> backend_name/
     route_policy/url_match/url_rewrite/methods), merged from two sources:
 
-    - `routes.toml` (ROUTE_CONFIG_FILE), hot-reloaded whenever its mtime
-      changes -- a mounted Docker volume or Kubernetes ConfigMap edit takes
-      effect without a pod restart. Read-only from this class's own
+    - The [[routes]] section of apython_lb.toml, read through a shared
+      ConfigFile (classes/config_file.py) and hot-reloaded whenever that
+      file changes -- a mounted Docker volume or Kubernetes ConfigMap edit
+      takes effect without a pod restart. Read-only from this class's own
       perspective: nothing here ever writes back to the file.
     - A `db` (AsyncDb), if one is given -- routes created/removed live via
       the `/v1/manage/routes` REST API, persisted in SQLite the same way
@@ -136,17 +136,17 @@ class RouteManager:
 
     def __init__(
         self,
-        file_path: str = ROUTE_CONFIG_FILE,
+        config_file=None,
         poll_interval: int = CONFIG_POLL_INTERVAL,
         db=None,
     ):
-        self.file_path = file_path
+        self.config_file = config_file if config_file is not None else ConfigFile()
         self.poll_interval = poll_interval
         self.db = db
         self._file_entries: list[RouteEntry] = []
         self._db_entries: list[RouteEntry] = []
         self._entries: list[RouteEntry] = []
-        self._mtime: float | None = None
+        self._file_generation: int | None = None
         self._db_rows_seen: list[dict] | None = None
 
     def _rebuild(self) -> None:
@@ -158,28 +158,30 @@ class RouteManager:
 
     def load_now(self) -> None:
         """
-        Load (or reload) file entries from disk. Raises on any invalid
-        entry, a missing/empty file, or a path that collides with an
+        Load (or reload) file entries. Raises on any invalid entry, a
+        missing/malformed file, or a path that collides with an
         already-loaded DB-sourced route -- fail loud rather than silently
         serve a stale or partial route table. Call this once, synchronously,
         during app startup (before the app accepts its first request) so
         there's no window where routes are configured but not yet loaded;
         start() below only handles reloading after that.
         """
-        entries = _load_entries(self.file_path)
+        generation = self.config_file.refresh()
+        source = self.config_file.source_path
+        entries = _entries_from_raw(self.config_file.routes, source)
 
         collisions = {e.path for e in entries} & {e.path for e in self._db_entries}
         if collisions:
             raise ValueError(
-                f"{self.file_path!r} path(s) {sorted(collisions)} collide with an "
+                f"{source!r} path(s) {sorted(collisions)} collide with an "
                 "existing API-created route -- remove the API-created route first, "
-                "or use a different path in routes.toml"
+                "or use a different path in the config file"
             )
 
         self._file_entries = entries
-        self._mtime = os.stat(self.file_path).st_mtime
+        self._file_generation = generation
         self._rebuild()
-        logger.debug(f"Loaded {len(entries)} route(s) from {self.file_path!r}")
+        logger.debug(f"Loaded {len(entries)} route(s) from {source!r}")
 
     async def reload_db(self) -> bool:
         """
@@ -281,13 +283,20 @@ class RouteManager:
             changed = False
 
             try:
-                mtime = os.stat(self.file_path).st_mtime
-                if mtime != self._mtime:
-                    logger.debug(f"{self.file_path!r} changed on disk, reloading routes")
+                # refresh() reparses only when the file actually changed and
+                # bumps its generation; comparing generations (rather than
+                # mtimes) means BackendManager polling the same ConfigFile
+                # can't consume a reload this manager then misses.
+                if self.config_file.refresh() != self._file_generation:
+                    logger.debug(
+                        f"{self.config_file.source_path!r} changed on disk, reloading routes"
+                    )
                     self.load_now()
                     changed = True
             except Exception as exc:
-                logger.error(f"Failed to reload routes from {self.file_path!r}: {exc}")
+                logger.error(
+                    f"Failed to reload routes from {self.config_file.source_path!r}: {exc}"
+                )
 
             try:
                 if await self.reload_db():

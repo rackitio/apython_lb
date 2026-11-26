@@ -35,10 +35,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV MODSECURITY_ENABLED=true
 ENV MODSECURITY_RULES_FILE=/app/modsecurity.conf
 
-# Dynamic route config (classes/route_manager.py) -- same mount-or-bake
-# pattern as MODSECURITY_RULES_FILE above: a default routes.toml ships in the
-# image (COPY . . below), override by mounting a different file (Docker
-# volume or k8s ConfigMap) at this same path.
+# Config file holding [[routes]] and [[backends]] (classes/config_file.py)
+# -- same mount-or-bake pattern as MODSECURITY_RULES_FILE above: a default
+# apython_lb.toml ships in the image (COPY . . below), override by mounting
+# a different file (Docker volume or k8s ConfigMap) at this same path.
+ENV APYTHON_LB_CONFIG=/app/apython_lb.toml
+
+# Deprecated. Only consulted when a file actually exists at this path, which
+# now only happens if an operator mounted one -- the image no longer ships a
+# routes.toml. Kept for one release so existing deployments that mount their
+# own keep working; doing so logs a deprecation warning at startup.
 ENV ROUTE_CONFIG_FILE=/app/routes.toml
 
 COPY requirements.txt requirements-dev.txt .

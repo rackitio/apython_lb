@@ -1,0 +1,125 @@
+# Configuration for apython_lb, loaded by classes/config_file.py.
+#
+# Baked into the image at /app/apython_lb.toml by default (see the
+# Dockerfile), the same way modsecurity.conf is -- override by mounting a
+# different file at the same path (Docker volume, or a Kubernetes ConfigMap)
+# and setting APYTHON_LB_CONFIG if you move it elsewhere. Changes to the
+# mounted file are picked up automatically within one CONFIG_POLL_INTERVAL
+# (default 10s), no restart needed.
+#
+# This single file holds both sections below. It replaces routes.toml, which
+# is still read when this file is absent so existing deployments keep working
+# for one release -- that fallback logs a deprecation warning at startup and
+# will be removed. Everything else is still configured by environment
+# variable for now (see the README's variable reference); folding those in
+# here is the next step.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# [[backends]] -- pools of servers to forward traffic to
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Backends can be defined here or created live through
+# POST /v1/manage/configs. A given name may only be claimed by ONE of those
+# two sources: creating a backend whose name is already defined in this file
+# is rejected outright, and a file edit that claims a name an API-created
+# backend already owns is refused (the previously loaded file config keeps
+# serving). There is no precedence rule to reason about -- a name is either
+# free or it isn't, the same rule [[routes]] paths already follow.
+#
+# Backends defined here are read-only from the API and admin UI's point of
+# view: nothing ever writes back to this file, so the UI shows them without
+# a remove button. Edit the file (or the mounted ConfigMap) to change them.
+#
+# Fields:
+#   name               required. The name [[routes]] entries reference as
+#                      backend_name.
+#   proto              required. "http" or "https" -- how to reach the
+#                      servers below.
+#   host               required. The Host header sent when health-checking
+#                      these servers, i.e. the virtual host they serve.
+#   servers            required. Array of IPs or hostnames. Hostnames are
+#                      resolved via DNS_NAMESERVERS at health-check and
+#                      request time, and one hostname resolving to several
+#                      addresses contributes all of them to the pool.
+#   health_check_path  optional, reserved. Accepted and stored, but health
+#                      checks always probe "/" -- see the README's "Health
+#                      checks" section. Defaults to "/".
+#
+# Commented out so a fresh install starts with no backends configured and
+# /health reports ready, exactly as it did before this file existed.
+# Uncomment and edit, or add your own:
+#
+# [[backends]]
+# name = "my_backend"
+# proto = "https"
+# host = "example.com"
+# servers = ["1.2.3.4", "app.example.com"]
+#
+# [[backends]]
+# name = "dns_backend"
+# proto = "https"
+# host = "dns.example.com"
+# servers = ["1.1.1.1", "1.0.0.1"]
+#
+# ─────────────────────────────────────────────────────────────────────────
+# [[routes]] -- which path goes to which backend
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Each [[routes]] entry maps a path prefix to a backend pool. The path with
+# the longest matching prefix wins (nginx `location`-block semantics) -- so
+# "/v1/" below is checked before the "/" catch-all for any request under
+# /v1/, regardless of the order the entries are written in.
+#
+# Routes follow the same one-owner rule as backends: a path defined here
+# can't also be created through POST /v1/manage/routes.
+#
+# Fields:
+#   path          required. Must start and end with "/" (e.g. "/", "/v1/").
+#   backend_name  required. Must match a backend defined in [[backends]]
+#                 above or registered via POST /v1/manage/configs.
+#   route_policy  required. One of: round_robin, sticky_session, sticky_ip.
+#   url_match     optional. nginx-style regex applied to the FULL forwarded
+#                 path, with no leading "/" (e.g. a request to "/v1/foo"
+#                 gives url_match the string "v1/foo") -- `path` above only
+#                 decides which route wins, it does NOT strip anything from
+#                 what url_match sees. If you want to strip a prefix, your
+#                 regex has to match it explicitly and not capture it, the
+#                 same way the "/v1/" entry below does: '^v1/?(.*)$' matches
+#                 "v1/" (or bare "v1", with no trailing slash at all -- see
+#                 next paragraph) at the start, no leading slash, and
+#                 captures only what comes after it. See url_rewrite.
+#
+#                 A request with nothing after the prefix -- "/v1" or "/v1/"
+#                 itself, not "/v1/something" -- still needs its own match:
+#                 raw_path is "v1" or "v1/" in that case, with no trailing
+#                 segment for a plain '^v1/(.+)$' to capture (the `+` means
+#                 "one or more", so zero characters after "v1/" fails to
+#                 match at all, and the path gets forwarded completely
+#                 unrewritten instead -- found the hard way, see PR #9).
+#                 '^v1/?(.*)$' (optional slash, `*` instead of `+`) handles
+#                 all three shapes -- "v1", "v1/", "v1/foo" -- rewriting the
+#                 first two to the backend's own root.
+#   url_rewrite   optional. Replacement for url_match; \1/\g<name> group
+#                 references supported. Only meaningful alongside url_match.
+#                 Keep a nested-quantifier pattern out of url_match: it runs
+#                 against every request to that path.
+#   methods       optional. List of HTTP methods this mapping accepts (e.g.
+#                 ["GET"]). Omit to default to ["GET", "POST"] -- shown
+#                 explicitly below so every available field is visible in
+#                 this default file, even where it's just the default value.
+#                 A request whose method isn't in this list gets a 405 with
+#                 an Allow header, not a silent fallthrough to another route.
+
+[[routes]]
+path = "/"
+backend_name = "my_backend"
+route_policy = "round_robin"
+methods = ["GET", "POST"]
+
+[[routes]]
+path = "/v1/"
+backend_name = "dns_backend"
+route_policy = "sticky_ip"
+url_match = '^v1/?(.*)$'
+url_rewrite = '\1'
+methods = ["GET", "POST"]

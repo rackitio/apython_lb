@@ -38,7 +38,7 @@ matters.
 - **Sticky by session** — pins a signed session to the same backend for
   cookie-based affinity.
 - **Dynamic routing** — path → backend/policy/rewrite mappings are configured
-  in `routes.toml` (see [Dynamic route configuration](#dynamic-route-configuration)),
+  in `apython_lb.toml` (see [Configuration file](#configuration-file)),
   hot-reloaded on change — no code change or redeploy to add, change, or
   remove a route.
 - **URL rewriting** — match and rewrite request paths before forwarding (strip
@@ -86,7 +86,7 @@ flowchart TD
     D -->|exceeded| D1([429 Retry-After])
     D -->|ok| E{"@modsec_waf<br/>WAF inspection"}
     E -->|blocked| E1([403 / 400 / 414])
-    E -->|allowed| F{"@dynamic_route<br/>match path in routes.toml?"}
+    E -->|allowed| F{"@dynamic_route<br/>match path in apython_lb.toml?"}
     F -->|no path match| F1([404 Not found])
     F -->|method not allowed| F2([405 + Allow header])
     F -->|matched| F3[/"_forward()"/]
@@ -114,10 +114,65 @@ flowchart TD
     R --> S([Response to client])
 ```
 
-## Dynamic route configuration
+## Configuration file
 
-Every proxied route is configured in `routes.toml` (loaded from
-`ROUTE_CONFIG_FILE`, default `/app/routes.toml`), not hardcoded in `main.py`.
+Backends and routes are both configured in `apython_lb.toml` (loaded from
+`APYTHON_LB_CONFIG`, default `/app/apython_lb.toml`) — one file, two
+sections, read by `classes/config_file.py`:
+
+| Section | What it defines | Also creatable via API |
+|---|---|---|
+| `[[backends]]` | Pools of servers to forward traffic to | `POST /v1/manage/configs` |
+| `[[routes]]` | Which path prefix goes to which backend | `POST /v1/manage/routes` |
+
+Changes to the mounted file are picked up within one `CONFIG_POLL_INTERVAL`
+(default 10s) with no restart, for both sections.
+
+> **Deprecated: `routes.toml` / `ROUTE_CONFIG_FILE`.** The image no longer
+> ships a `routes.toml`, but one is still read if it exists — so a
+> deployment mounting its own keeps working for this release, with a
+> deprecation warning logged at startup. A mounted `routes.toml` takes
+> precedence over `apython_lb.toml` deliberately: the image bakes in
+> `apython_lb.toml`, so that file existing says nothing about intent,
+> whereas a `routes.toml` only exists because someone put it there. If the
+> modern path won instead, mounting your existing routes file would
+> silently serve the image's defaults instead of your config. To migrate,
+> rename the file to `apython_lb.toml` (the route syntax is unchanged) and
+> move your backends into its `[[backends]]` section if you want them in
+> the file too. `ROUTE_CONFIG_FILE` will stop being honoured in a future
+> release.
+
+### Backends
+
+```toml
+[[backends]]
+name = "my_backend"
+proto = "https"
+host = "example.com"                      # Host header used for health checks
+servers = ["1.2.3.4", "app.example.com"]  # IPs or hostnames
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | What `[[routes]]` entries reference as `backend_name` |
+| `proto` | yes | `http` or `https` — how to reach the servers below |
+| `host` | yes | The `Host` header sent when health-checking these servers |
+| `servers` | yes | Array of IPs or hostnames. Hostnames are resolved via `DNS_NAMESERVERS`, and one hostname resolving to several addresses contributes all of them to the pool |
+| `health_check_path` | no | Accepted and stored, but **reserved** — health checks always probe `/`. See [Health checks](#health-checks) |
+
+Backends defined in the file are **read-only from the API and UI's point of
+view** — nothing ever writes back to the file, so `/v1/manage` renders them
+without a remove button. Edit the file (or its ConfigMap) to change them.
+
+**A backend name may only be claimed by one source.** Creating a backend
+whose name the file already defines is rejected outright, and a file edit
+claiming a name an API-created backend owns is refused (the previously
+loaded file config keeps serving). There's no precedence rule to reason
+about: a name is either free or it isn't — the same rule routes follow
+below.
+
+### Routes
+
 One `@app.route("/<path:path>")` dispatcher (`@dynamic_route`, in
 `decorators/apython_lb.py`) handles every request, looking up the configured
 mapping for the incoming path at request time via `classes/route_manager.py`.
@@ -151,7 +206,7 @@ methods = ["GET"]
 | Field | Required | Description |
 |---|---|---|
 | `path` | yes | Must start and end with `/` (e.g. `/`, `/v1/`) — prefix-matched against the request path, **longest match wins** (nginx `location`-block semantics), so a more specific path doesn't need to be listed before a shorter one it overlaps with |
-| `backend_name` | yes | Must match a backend pool registered via `POST /v1/manage/configs` (see [Add backends via curl](#add-backends-via-curl)) |
+| `backend_name` | yes | Must match a backend defined in `[[backends]]` above, or registered via `POST /v1/manage/configs` (see [Add backends via curl](#add-backends-via-curl)) |
 | `route_policy` | yes | `round_robin`, `sticky_session`, or `sticky_ip` |
 | `url_match` / `url_rewrite` | no | nginx-style rewrite, applied to the **full** forwarded path (no leading `/`, and **not** pre-stripped of the `path` prefix above — see the warning below) |
 | `methods` | no | List of HTTP methods this mapping accepts. Omitted = `GET` and `POST`. A path match with a disallowed method gets a `405` with an `Allow` header, not a silent fallthrough to another route |
@@ -163,7 +218,7 @@ A request matching no configured `path` gets a `404`.
 >
 > That regex also has to account for a request with **nothing after the prefix** — `/v1` or `/v1/` itself, not `/v1/something`. `raw_path` in that case is `"v1"` or `"v1/"`, with no trailing segment for a `(.+)` (one-or-more) group to capture, so a pattern like `^v1/(.+)$` silently fails to match and the path gets forwarded completely **unrewritten** instead of hitting the backend's root — found during real load-testing of this PR (it manifests as a 404 from the backend, which can cascade into the [IP tracker](#variable-reference) penalizing the client after a few of them). The shipped `/v1/` entry now uses `^v1/?(.*)$` (optional slash, `*` instead of `+`) to handle all three shapes — `v1`, `v1/`, `v1/foo` — correctly. **If you're running a `routes.toml` from an earlier build of this branch with a `(.+)$`-style pattern, update it** — a bare request to that prefix now forwards differently (to the backend's root) than it did before, which is itself a behavior change worth testing before you roll it out.
 >
-> The static `apython_lb()` decorator's own `/v1/` example (below, under [URL rewrite](#url-rewrite)) does **not** need this change — it registers its own dedicated `@app.route("/v1/", defaults={"path": ""})` rule, which supplies an empty path directly for the bare-prefix case regardless of what the regex does. That per-route `defaults=` mechanism doesn't exist for the one shared dynamic dispatcher, which is why `routes.toml` entries need a regex that explicitly handles it.
+> The static `apython_lb()` decorator's own `/v1/` example (below, under [URL rewrite](#url-rewrite)) does **not** need this change — it registers its own dedicated `@app.route("/v1/", defaults={"path": ""})` rule, which supplies an empty path directly for the bare-prefix case regardless of what the regex does. That per-route `defaults=` mechanism doesn't exist for the one shared dynamic dispatcher, which is why `apython_lb.toml` entries need a regex that explicitly handles it.
 
 **Hot reload**: the file is re-read whenever its mtime changes, polled every
 `CONFIG_POLL_INTERVAL` seconds (the same interval `BackendManager` already
@@ -172,19 +227,21 @@ restart. A bad edit (invalid `route_policy`, unparseable `url_match`, a
 `path` missing its trailing slash, a duplicate `path`, …) is rejected and
 logged; the *previously loaded, valid* table keeps serving traffic rather
 than the app falling over on a typo. At startup, though, a missing or
-invalid `routes.toml` fails loud — the app won't come up silently unrouted.
+invalid `apython_lb.toml` fails loud — the app won't come up silently unrouted.
 
-**Overriding the default file**: the image bakes in `routes.toml` from this
+**Overriding the default file**: the image bakes in `apython_lb.toml` from this
 repo (same pattern as `MODSECURITY_RULES_FILE`/`modsecurity.conf`) —
-reproducing the two routes above out of the box. Point `ROUTE_CONFIG_FILE`
-at a different path and mount your own file there to change it — a Docker
-volume locally, or a Kubernetes `ConfigMap` mounted into the pod, which
-`kubelet` keeps in sync with the file on disk automatically.
+reproducing the two routes above out of the box, with the `[[backends]]`
+example commented out so a fresh install starts with nothing configured.
+Mount your own file over `/app/apython_lb.toml`, or point
+`APYTHON_LB_CONFIG` at a different path — a Docker volume locally, or a
+Kubernetes `ConfigMap` mounted into the pod, which `kubelet` keeps in sync
+with the file on disk automatically.
 
-**Static, code-defined routes are still supported, and coexist with `routes.toml`** —
+**Static, code-defined routes are still supported, and coexist with `apython_lb.toml`** —
 `apython_lb()` (the original decorator, still in `decorators/apython_lb.py`)
 takes `backend_name`/`route_policy`/`url_match`/`url_rewrite` as decorator
-kwargs instead of resolving them from `routes.toml`, for anyone who'd rather
+kwargs instead of resolving them from `apython_lb.toml`, for anyone who'd rather
 wire a specific route in code. See [URL rewrite](#url-rewrite) for an
 example. Register one alongside the generic dynamic dispatcher and both work
 at once — confirmed directly, not just assumed: Werkzeug ranks routes by
@@ -193,15 +250,15 @@ path (e.g. `/special/<path:path>`) is always tried before the fully-generic
 `/<path:path>` dynamic catch-all, regardless of where either is registered.
 
 One real gotcha from that: if a static route's path **overlaps** with a
-`routes.toml` entry (the same path, or a prefix of it), the static route
+`apython_lb.toml` entry (the same path, or a prefix of it), the static route
 always wins for any URL it matches — Werkzeug never reaches `dynamic_route`
 for those requests at all. `RouteManager` has no visibility into the static
-side of the app, so an overlapping `routes.toml` entry isn't an error, it's
+side of the app, so an overlapping `apython_lb.toml` entry isn't an error, it's
 just silently unreachable for that URL space. Keep static routes and
-`routes.toml` entries on non-overlapping paths unless shadowing part of a
+`apython_lb.toml` entries on non-overlapping paths unless shadowing part of a
 dynamic entry is actually what you want.
 
-**Routes can also be managed live, through the API or the `/v1/manage` dashboard** — `routes.toml` isn't the only way to configure routing. Routes created this way are stored in the same SQLite database backend configs already use (`SQLITE_DB`), so they persist across restarts and are visible to every worker via the same poll loop that already watches `routes.toml`.
+**Routes can also be managed live, through the API or the `/v1/manage` dashboard** — `apython_lb.toml` isn't the only way to configure routing. Routes created this way are stored in the same SQLite database backend configs already use (`SQLITE_DB`), so they persist across restarts and are visible to every worker via the same poll loop that already watches `apython_lb.toml`.
 
 ```bash
 curl -X POST https://your-host/v1/manage/routes \
@@ -219,26 +276,26 @@ curl -X DELETE https://your-host/v1/manage/routes/1
 ```
 
 `path`, `backend_name`, and `route_policy` are required; `url_match`/
-`url_rewrite`/`methods` are optional, same meaning as the `routes.toml`
+`url_rewrite`/`methods` are optional, same meaning as the `apython_lb.toml`
 fields above (`methods` is a comma-separated string here, e.g. `"GET,POST"`
 — omit it for the same `GET`+`POST` default). Both endpoints are
 `internal_only` like every other `/v1/manage/*` route.
 
 **A route's path can only be defined by one source at a time.** Creating a
-route at a path that's already covered — by an existing `routes.toml`
+route at a path that's already covered — by an existing `apython_lb.toml`
 entry *or* another API-created route — is rejected outright with a clear
 error, rather than silently overriding or shadowing it. There's no
 precedence rule to reason about between the two sources: a path is either
-free or it isn't. The reverse direction is covered too — if `routes.toml`
+free or it isn't. The reverse direction is covered too — if `apython_lb.toml`
 is edited to add a path an API-created route already owns, that reload is
 rejected the same way a bad file edit always has been (logged, previous
 valid table keeps serving).
 
-API-created routes are also **frozen from `routes.toml`'s side**: nothing
+API-created routes are also **frozen from `apython_lb.toml`'s side**: nothing
 in this app ever writes back to the file. The admin UI reflects this —
 routes it rendered from the file show no remove button at all (labelled
-"from routes.toml"); only API-created routes get one. To change or remove
-a `routes.toml`-sourced route, edit the file (or the mounted ConfigMap)
+"from config file"); only API-created routes get one. To change or remove
+a `apython_lb.toml`-sourced route, edit the file (or the mounted ConfigMap)
 directly, same as before this existed.
 
 ## Variable Reference
@@ -255,8 +312,9 @@ directly, same as before this existed.
 | `MANAGE_BASIC_AUTH` | *(unset)* | Optional `user:password` for HTTP Basic auth on the management UI, `/ws/configs`, and `/metrics`, on top of the internal-IP restriction. Set it in any deployment where the internal network is not fully trusted |
 | `MAX_CONTENT_LENGTH` | `16777216` | Maximum request body size in bytes (bodies are buffered in memory for WAF inspection and forwarding) |
 | `HEALTH_CHECK_INTERVAL` | `60` | How often (seconds) backends are health-checked. A backend is healthy only when it answers `GET /` with HTTP **200** (see [Health checks](#health-checks)) |
-| `CONFIG_POLL_INTERVAL` | `10` | How often (seconds) the DB is polled for backend config changes, and `routes.toml` for route changes (see [Dynamic route configuration](#dynamic-route-configuration)) |
-| `ROUTE_CONFIG_FILE` | `/app/routes.toml` | Path to the dynamic route config file — see [Dynamic route configuration](#dynamic-route-configuration) |
+| `CONFIG_POLL_INTERVAL` | `10` | How often (seconds) the DB and `apython_lb.toml` are polled for backend and route changes (see [Configuration file](#configuration-file)) |
+| `APYTHON_LB_CONFIG` | `/app/apython_lb.toml` | Path to the config file holding `[[backends]]` and `[[routes]]` — see [Configuration file](#configuration-file) |
+| `ROUTE_CONFIG_FILE` | `/app/routes.toml` | **Deprecated.** Legacy routes-only file. Only consulted when a file actually exists at this path, which now only happens if you mounted one; it then takes precedence over `APYTHON_LB_CONFIG` and logs a deprecation warning — see [Configuration file](#configuration-file) |
 | `METRICS_HISTORY_INTERVAL` | `5` | How often (seconds) the management UI's metrics sparklines are sampled — see [Metrics dashboard](#metrics-dashboard) |
 | `METRICS_HISTORY_POINTS` | `180` | How many samples of history each metrics sparkline keeps (default: ~15 minutes at the 5s interval default) |
 | `DNS_NAMESERVERS` | `8.8.8.8,1.1.1.1` | Comma-separated DNS nameservers for backend hostname resolution (the Docker image sets `1.1.1.1`) |
@@ -515,8 +573,8 @@ kubectl rollout restart deployment/apython-lb deployment/apython-lb-test --names
 
 ### Rate limiting
 The examples below use the static `@apython_lb` decorator (see
-[Dynamic route configuration](#dynamic-route-configuration) for the
-`routes.toml` alternative) because per-route rate-limit overrides are a
+[Configuration file](#configuration-file) for the
+`apython_lb.toml` alternative) because per-route rate-limit overrides are a
 code-only feature for now — the dynamic table applies one app-wide limit
 (`RATE_LIMIT_REQUESTS`/`RATE_LIMIT_WINDOW_SECONDS`) to every route in it.
 ```python
@@ -536,10 +594,10 @@ def api_proxy(path): pass
 Rejected requests get a `429` with a `Retry-After` header.
 
 ### URL rewrite
-The equivalent `routes.toml` entry for the common case (strip a `/v1`
+The equivalent `apython_lb.toml` entry for the common case (strip a `/v1`
 prefix before forwarding). Note the `?` and `*` — this needs to match a bare
 `/v1` or `/v1/` request too, not just `/v1/something`; see the warning in
-[Dynamic route configuration](#dynamic-route-configuration) for why:
+[Configuration file](#configuration-file) for why:
 ```toml
 [[routes]]
 path = "/v1/"
@@ -551,7 +609,7 @@ url_rewrite = '\1'
 
 The same thing with the static decorator, and two more rewrite patterns —
 useful if you want a specific route wired up in code rather than in
-`routes.toml`. This one doesn't need the `?`/`*` treatment above: its own
+`apython_lb.toml`. This one doesn't need the `?`/`*` treatment above: its own
 dedicated `defaults={"path": ""}` rule already supplies an empty path for
 the bare-`/v1/`-or-`/v1` case directly, independent of what `url_match` does:
 ```python
@@ -589,11 +647,15 @@ def api_proxy(path): pass
 def files_proxy(path): pass
 ```
 ### Add backends via curl
+Backends can also be declared in the config file's `[[backends]]` section
+instead of through the API — see [Configuration file](#configuration-file);
+a name may only be claimed by one of the two.
+
 The examples assume the container from [Running Locally](#running-locally),
 listening on `https://localhost:8443` (`-k` because the local cert is
-self-signed). Backend IPs are comma-separated with no spaces; all five fields
-are required (`hc_path` is stored but not yet used — see
-[Health checks](#health-checks)):
+self-signed). Backend IPs are comma-separated with no spaces; `name`,
+`proto`, `host` and `ips` are required (`hc_path` is optional, and stored
+but not yet used — see [Health checks](#health-checks)):
 ```bash
 curl -sk -X POST https://localhost:8443/v1/manage/configs \
   -H "Content-Type: application/json" \

@@ -7,6 +7,7 @@
 from .dns_resolver import AsyncDNSResolver
 from .round_robin import AsyncRoundRobin
 from .sqlite_db import AsyncDb
+from .config_file import ConfigFile
 from .backend_manager import BackendManager
 from .sticky_session import StickyRoundRobin
 from .ip_tracker import IPTracker

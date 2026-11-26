@@ -36,6 +36,65 @@ HEALTH_READY_BACKENDS = frozenset(
 )
 
 
+_VALID_PROTOCOLS = {"http", "https"}
+
+
+def _validate_backend(raw: dict) -> tuple[str, tuple]:
+    """
+    Validate one [[backends]] table from the config file and convert it to
+    the (protocol, host_name, ip_str, hc_path) tuple _configs already
+    stores, so every consumer below (health checks, _parse_servers,
+    readiness) works identically whether a backend came from the file or
+    the database.
+
+    `servers` is a native TOML array here but is joined into the
+    comma-separated string the DB-backed path has always used -- one
+    internal shape, two friendlier front doors.
+    """
+    name = raw.get("name")
+    if not name or not isinstance(name, str):
+        raise ValueError(f"Backend entry is missing a 'name': {raw!r}")
+
+    proto = raw.get("proto")
+    if proto not in _VALID_PROTOCOLS:
+        raise ValueError(
+            f"Backend {name!r} has invalid proto {proto!r}. Must be one of "
+            f"{sorted(_VALID_PROTOCOLS)}"
+        )
+
+    host = raw.get("host")
+    if not host or not isinstance(host, str):
+        raise ValueError(
+            f"Backend {name!r} is missing required 'host' (the Host header sent "
+            "when health-checking its servers)"
+        )
+
+    servers = raw.get("servers")
+    if not isinstance(servers, list) or not servers:
+        raise ValueError(
+            f"Backend {name!r} needs a non-empty 'servers' array of IPs or hostnames, "
+            f'e.g. servers = ["1.2.3.4", "app.example.com"] -- got {servers!r}'
+        )
+    if not all(isinstance(s, str) and s.strip() for s in servers):
+        raise ValueError(f"Backend {name!r} has a non-string or empty entry in 'servers'")
+
+    # Reserved, same as the API's hc_path: accepted and stored, but health
+    # checks always probe "/" (see the README's "Health checks" section).
+    hc_path = raw.get("health_check_path", "/")
+
+    return name, (proto, host, ",".join(s.strip() for s in servers), hc_path)
+
+
+def _backends_from_raw(raw_backends: list[dict], source: str) -> dict[str, tuple]:
+    configs = {}
+    for raw in raw_backends:
+        name, config = _validate_backend(raw)
+        if name in configs:
+            raise ValueError(f"Duplicate backend name {name!r} in {source!r}")
+        configs[name] = config
+    return configs
+
+
 class BackendManager:
     def __init__(
         self,
@@ -44,8 +103,10 @@ class BackendManager:
         config_poll_interval: int = CONFIG_POLL_INTERVAL,
         ready_min_backends: int | None = HEALTH_READY_MIN_BACKENDS,
         ready_backends: frozenset[str] = HEALTH_READY_BACKENDS,
+        config_file=None,
     ):
         self.db = db
+        self.config_file = config_file
         self.health_check_interval = health_check_interval
         self.config_poll_interval = config_poll_interval
         self.ready_min_backends = ready_min_backends
@@ -61,8 +122,14 @@ class BackendManager:
         # name -> StickyRoundRobin
         self._backends: dict[str, StickyRoundRobin] = {}
         self._sticky_ip: StickyIP = StickyIP()
-        # name -> config tuple (protocol, host_name, ip_str, path)
+        # name -> config tuple (protocol, host_name, ip_str, path), merged
+        # from both sources below
         self._configs: dict[str, tuple] = {}
+        # File-defined backends, kept separately so API-created ones can be
+        # distinguished from them (the admin UI renders file-defined
+        # backends read-only, and a name may only be claimed by one source)
+        self._file_configs: dict[str, tuple] = {}
+        self._file_generation: int | None = None
 
         # Last known state snapshots for change detection
         # name -> frozenset of healthy URLs
@@ -132,11 +199,108 @@ class BackendManager:
             logger.debug(f"Connection error for {server}: {exc}")
             return False
 
+    def reload_file(self) -> bool:
+        """
+        Reload file-defined backends if the shared config file changed.
+        Returns True when the file-sourced view actually changed.
+
+        A name already claimed by an API-created backend is refused for the
+        whole reload (the previously loaded file config keeps serving),
+        matching RouteManager.load_now()'s collision behavior -- one name,
+        one owner, with no silent precedence either way.
+        """
+        if self.config_file is None:
+            return False
+
+        generation = self.config_file.refresh()
+        if generation == self._file_generation:
+            return False
+
+        source = self.config_file.source_path
+        file_configs = _backends_from_raw(self.config_file.backends, source)
+
+        db_owned = set(self._configs) - set(self._file_configs)
+        collisions = set(file_configs) & db_owned
+        if collisions:
+            raise ValueError(
+                f"{source!r} backend name(s) {sorted(collisions)} collide with an "
+                "existing API-created backend -- remove the API-created one first, "
+                "or use a different name in the config file"
+            )
+
+        self._file_configs = file_configs
+        self._file_generation = generation
+        logger.debug(f"Loaded {len(file_configs)} backend(s) from {source!r}")
+        return True
+
+    def validate_new_name(self, name: str) -> None:
+        """Raise if `name` is already defined by either source. Called by the
+        REST layer before insert, the same way RouteManager.validate_new_path()
+        guards route creation."""
+        if name in self._file_configs:
+            raise ValueError(
+                f"Backend name {name!r} is already defined in the config file -- "
+                "pick a different name, or remove it from the file first"
+            )
+        if name in self._configs:
+            raise ValueError(
+                f"Backend name {name!r} already exists -- pick a different name, "
+                "or remove the existing backend first"
+            )
+
+    def file_backend_names(self) -> frozenset[str]:
+        """Names defined by the config file, for the admin UI to render those
+        entries read-only (nothing ever writes back to the file)."""
+        return frozenset(self._file_configs)
+
+    def list_configs(self, db_configs: list[dict]) -> list[dict]:
+        """
+        Unified backend list for the admin UI: file-defined backends first
+        (tagged source="file", no row id since they aren't in the database),
+        then API-created ones. Keeps the shape the templates already expect
+        -- id/name/data/last_selected -- and adds `source` so the UI knows
+        which entries it may offer a remove button for.
+        """
+        items = [
+            {
+                "id": None,
+                "name": name,
+                "data": list(config),
+                "last_selected": None,
+                "source": "file",
+            }
+            for name, config in sorted(self._file_configs.items())
+        ]
+        items.extend(
+            {**config, "source": "db"}
+            for config in db_configs
+            if config["name"] not in self._file_configs
+        )
+        return items
+
     async def _poll_configs_once(self):
-        """Run a single config-poll pass: sync backends with the DB state."""
+        """Run a single config-poll pass: sync backends with the config file
+        and the DB state."""
+        try:
+            self.reload_file()
+        except Exception as exc:
+            logger.error(f"Failed to reload backends from the config file: {exc}")
+
         db_configs = await self.db.get_all_configs()
         current_names: set[str] = set()
         config_changed = False
+
+        # File-defined backends first so a DB row can never quietly take over
+        # a name the file owns -- validate_new_name() rejects that at creation
+        # time, and this is the backstop if one slipped in anyway.
+        for name, new_config in self._file_configs.items():
+            current_names.add(name)
+            if name not in self._configs or self._configs[name] != new_config:
+                logger.debug(f"New/updated file-defined config for '{name}'")
+                self._configs[name] = new_config
+                config_changed = True
+                if name not in self._backends:
+                    self._backends[name] = StickyRoundRobin([])
 
         # Add new or updated backends. get_all_configs() orders rows by
         # LastSelected DESC, so the first row seen for a name is the most
@@ -144,6 +308,12 @@ class BackendManager:
         # the newest config win ("last config in wins").
         for config in db_configs:
             name = config["name"]
+            if name in self._file_configs:
+                logger.warning(
+                    f"Ignoring API-created backend '{name}': that name is defined in "
+                    "the config file, which owns it"
+                )
+                continue
             if name in current_names:
                 logger.debug(f"Duplicate config name '{name}', keeping the most recent one")
                 continue
@@ -158,7 +328,7 @@ class BackendManager:
                 if name not in self._backends:
                     self._backends[name] = StickyRoundRobin([])
 
-        # Remove backends no longer in DB
+        # Remove backends no longer defined by either source
         for name in list(self._backends.keys()):
             if name not in current_names:
                 logger.debug(f"Config removed for '{name}', dropping backend.")

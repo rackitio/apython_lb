@@ -41,7 +41,7 @@ RATE_LIMIT_PARTIAL = """
 @v1_manage.route("/v1/manage", methods=["GET"])
 @ip_restriction.internal_only
 async def index():
-    configs = await db.get_all_configs()
+    configs = current_app.backend_manager.list_configs(await db.get_all_configs())
     backends = []
     for rr in current_app.backend_manager._backends.values():
         items = await rr.get_all()
@@ -90,10 +90,18 @@ async def create_config():
     proto = data.get("proto")
     host = data.get("host")
     ips = data.get("ips")
-    hc_path = data.get("hc_path")
+    # Reserved like the config file's health_check_path: stored, but health
+    # checks always probe "/" (see the README's "Health checks" section).
+    # Optional on both front doors so the file and the API agree.
+    hc_path = data.get("hc_path") or "/"
 
-    if not all([name, proto, host, ips, hc_path]):
+    if not all([name, proto, host, ips]):
         return '<span style="color:red">✗ Missing required fields</span>', 400
+
+    try:
+        current_app.backend_manager.validate_new_name(name)
+    except ValueError as exc:
+        return f'<span style="color:red">✗ {exc}</span>', 400
 
     await db.insert_config(name, [proto, host, ips, hc_path])
 

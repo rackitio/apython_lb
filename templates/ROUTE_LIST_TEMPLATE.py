@@ -15,7 +15,7 @@ ROUTE_LIST_TEMPLATE = """
                     class="btn-remove">&#10005; remove</button>
         </form>
         {% else %}
-        <span class="route-source">from routes.toml</span>
+        <span class="route-source">from config file</span>
         {% endif %}
     </summary>
     <div class="config-item">
