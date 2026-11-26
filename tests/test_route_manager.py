@@ -4,7 +4,25 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from classes.route_manager import RouteEntry, RouteManager, _load_entries
+from classes.config_file import ConfigFile
+from classes.route_manager import RouteEntry, RouteManager, _entries_from_raw
+
+
+def _config_file(file_path) -> ConfigFile:
+    # legacy_path == path so the routes.toml fallback never kicks in here;
+    # these tests are about parsing and merging, not migration.
+    return ConfigFile(path=str(file_path), legacy_path=str(file_path))
+
+
+def load_entries(file_path):
+    """Parse + validate a config file's routes the way RouteManager does."""
+    config_file = _config_file(file_path)
+    config_file.load()
+    return _entries_from_raw(config_file.routes, str(file_path))
+
+
+def manager_for(file_path, **kwargs) -> RouteManager:
+    return RouteManager(config_file=_config_file(file_path), **kwargs)
 
 
 class FakeDb:
@@ -44,7 +62,7 @@ def test_load_entries_parses_valid_file(tmp_path):
         """,
     )
 
-    entries = _load_entries(file_path)
+    entries = load_entries(file_path)
 
     # Longest path first.
     assert [e.path for e in entries] == ["/v1/", "/"]
@@ -65,7 +83,7 @@ def test_load_entries_respects_explicit_methods(tmp_path):
         """,
     )
 
-    entries = _load_entries(file_path)
+    entries = load_entries(file_path)
 
     assert entries[0].methods == frozenset({"GET"})  # uppercased
 
@@ -142,19 +160,19 @@ def test_load_entries_fails_loud_on_invalid_config(tmp_path, bad_toml):
     file_path = write_toml(tmp_path / "routes.toml", bad_toml)
 
     with pytest.raises(ValueError):
-        _load_entries(file_path)
+        load_entries(file_path)
 
 
 def test_load_entries_fails_on_empty_routes_list(tmp_path):
     file_path = write_toml(tmp_path / "routes.toml", "routes = []\n")
 
     with pytest.raises(ValueError):
-        _load_entries(file_path)
+        load_entries(file_path)
 
 
 def test_load_entries_fails_on_missing_file(tmp_path):
     with pytest.raises(OSError):
-        _load_entries(str(tmp_path / "does-not-exist.toml"))
+        load_entries(str(tmp_path / "does-not-exist.toml"))
 
 
 # ── Matching ──────────────────────────────────────────────────────────────── #
@@ -244,7 +262,7 @@ def test_load_now_picks_up_file_changes(tmp_path):
         route_policy = "round_robin"
         """,
     )
-    rm = RouteManager(file_path=str(file_path), poll_interval=1)
+    rm = manager_for(file_path, poll_interval=1)
     rm.load_now()
     assert rm.match("/x", "GET")[0].backend_name == "pool_a"
 
@@ -286,7 +304,7 @@ async def test_start_reloads_in_the_background_on_mtime_change(tmp_path, monkeyp
         route_policy = "round_robin"
         """,
     )
-    rm = RouteManager(file_path=str(file_path), poll_interval=0.1)
+    rm = manager_for(file_path, poll_interval=0.1)
     rm.load_now()
 
     task = asyncio.ensure_future(rm.start())
@@ -338,7 +356,7 @@ async def test_reload_db_merges_entries_into_match(tmp_path):
         route_policy = "round_robin"
         """,
     )
-    rm = RouteManager(file_path=file_path, db=FakeDb([DB_ROW]))
+    rm = manager_for(file_path, db=FakeDb([DB_ROW]))
     rm.load_now()
 
     changed = await rm.reload_db()
@@ -366,7 +384,7 @@ async def test_reload_db_returns_false_when_nothing_changed(tmp_path):
         """,
     )
     fake_db = FakeDb([DB_ROW])
-    rm = RouteManager(file_path=file_path, db=fake_db)
+    rm = manager_for(file_path, db=fake_db)
     rm.load_now()
 
     assert await rm.reload_db() is True
@@ -389,7 +407,7 @@ async def test_reload_db_skips_invalid_row_and_keeps_rest(tmp_path):
         """,
     )
     bad_row = dict(DB_ROW, id=2, path="/bad/", route_policy="most_requests")
-    rm = RouteManager(file_path=file_path, db=FakeDb([DB_ROW, bad_row]))
+    rm = manager_for(file_path, db=FakeDb([DB_ROW, bad_row]))
     rm.load_now()
     await rm.reload_db()
 
@@ -409,7 +427,7 @@ async def test_reload_db_skips_row_colliding_with_file_path(tmp_path):
         """,
     )
     colliding_row = dict(DB_ROW, path="/v2/")
-    rm = RouteManager(file_path=file_path, db=FakeDb([colliding_row]))
+    rm = manager_for(file_path, db=FakeDb([colliding_row]))
     rm.load_now()
     await rm.reload_db()
 
@@ -444,7 +462,7 @@ def test_load_now_rejects_file_path_colliding_with_db_entry(tmp_path):
         route_policy = "round_robin"
         """,
     )
-    rm = RouteManager(file_path=file_path)
+    rm = manager_for(file_path)
     rm._db_entries = [
         RouteEntry(path="/v2/", backend_name="x", route_policy="round_robin", source="db")
     ]

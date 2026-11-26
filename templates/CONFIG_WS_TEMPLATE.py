@@ -68,6 +68,10 @@ CONFIG_WS_TEMPLATE = """
         {% for config in configs %}
         <details>
             <summary>
+                {% if config.source == "file" %}
+                <span class="summary-label">{{ config.name }}</span>
+                <span class="route-source">from config file</span>
+                {% else %}
                 <span class="summary-label">config id: {{ config.id }} — {{ config.name }}</span>
                 <!-- onclick sends select:<id> / delete:<id> over the existing WS connection -->
                 <button class="btn-select"
@@ -76,6 +80,7 @@ CONFIG_WS_TEMPLATE = """
                 <button class="btn-remove"
                         onclick="event.stopPropagation(); wsSend('delete:{{ config.id }}')"
                         title="Remove config {{ config.id }}">✕ remove</button>
+                {% endif %}
             </summary>
             <div class="config-item">
                 <p>

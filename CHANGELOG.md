@@ -63,6 +63,31 @@ history.
   the API/UI's side (nothing writes back to the file).
   ([#11](https://github.com/rackitio/apython_lb/pull/11))
 
+- **Backends in the config file**, closing the parity gap with routes:
+  a `[[backends]]` section in the new unified `apython_lb.toml`
+  (`APYTHON_LB_CONFIG`) declares backend pools without any API call, so a
+  deployment can be described entirely by a mounted file or ConfigMap.
+  `servers` is a native TOML array rather than a delimited string. The
+  same one-owner rule routes already follow applies: a backend name may be
+  claimed by the file or by `POST /v1/manage/configs`, never both, and
+  collisions are rejected in either direction instead of one silently
+  shadowing the other. File-defined backends render read-only in
+  `/v1/manage` — nothing ever writes back to the file. Both sections are
+  read through one shared `ConfigFile` (`classes/config_file.py`), so the
+  file is parsed once per change and both managers always see the same
+  version of it.
+  ([#12](https://github.com/rackitio/apython_lb/pull/12))
+
+### Deprecated
+
+- `routes.toml` and `ROUTE_CONFIG_FILE`, superseded by `apython_lb.toml`
+  and `APYTHON_LB_CONFIG`. The image no longer ships a `routes.toml`, but
+  one is still read when it exists so deployments mounting their own keep
+  working for this release, with a deprecation warning at startup; a
+  mounted legacy file deliberately takes precedence over the image's baked
+  in default (see the README for why). Rename the file to migrate — the
+  route syntax is unchanged. ([#12](https://github.com/rackitio/apython_lb/pull/12))
+
 ### Fixed
 
 - `routes.toml`'s own inline comment incorrectly claimed `url_match` runs

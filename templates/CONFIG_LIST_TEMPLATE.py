@@ -3,6 +3,10 @@ CONFIG_LIST_TEMPLATE = """
 {% for config in configs %}
 <details>
     <summary style="display:flex; align-items:center; gap:8px;">
+        {% if config.source == "file" %}
+        <span style="flex:1">{{ config.name }}</span>
+        <span class="route-source">from config file</span>
+        {% else %}
         <span style="flex:1">config id: {{ config.id }} — {{ config.name }}</span>
         <!-- wsSend() is defined on the parent page (CONFIG_WS_TEMPLATE) -->
         <button type="button"
@@ -22,6 +26,7 @@ CONFIG_LIST_TEMPLATE = """
                            color:red; border:1px solid red; background:none;
                            border-radius:4px;">✕ remove</button>
         </form>
+        {% endif %}
     </summary>
     <div class="config-item">
         <p>

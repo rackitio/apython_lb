@@ -21,10 +21,10 @@ connected_clients: set = set()
 
 async def broadcast_config_update():
     """Broadcast updated configs and active backends to all connected clients."""
-    configs = await db.get_all_configs()
+    backend_manager = current_app.backend_manager
+    configs = backend_manager.list_configs(await db.get_all_configs())
 
     backends = []
-    backend_manager = current_app.backend_manager
     logger.debug(f"[broadcast] _backends keys: {list(backend_manager._backends.keys())}")
 
     for name, rr in backend_manager._backends.items():

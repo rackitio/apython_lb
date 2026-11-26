@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from classes.backend_manager import BackendManager
+from classes.backend_manager import BackendManager, _backends_from_raw, _validate_backend
 
 
 class DummyDb:
@@ -232,3 +232,186 @@ async def test_start_populates_configs_before_loops_are_scheduled(monkeypatch):
 
     assert seen["health_check_loop"] != {}
     assert "pool" in seen["health_check_loop"]
+
+
+# ── file-defined backends ────────────────────────────────────────────────── #
+
+
+class FakeConfigFile:
+    """Stand-in for ConfigFile -- BackendManager only calls refresh(),
+    .backends and .source_path on it."""
+
+    def __init__(self, backends=None, source_path="apython_lb.toml"):
+        self.backends = backends or []
+        self.source_path = source_path
+        self._generation = 0
+
+    def refresh(self) -> int:
+        self._generation += 1
+        return self._generation
+
+    def set_backends(self, backends):
+        self.backends = backends
+
+
+def _file_backend(name="file_pool", servers=None):
+    return {
+        "name": name,
+        "proto": "https",
+        "host": "example.com",
+        "servers": servers or ["1.2.3.4", "app.example.com"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_file_defined_backend_is_pooled_and_health_checkable(monkeypatch):
+    monkeypatch.setattr("classes.backend_manager.broadcast_config_update", AsyncMock())
+    manager = BackendManager(db=DummyDb(), config_file=FakeConfigFile([_file_backend()]))
+
+    await manager._poll_configs_once()
+
+    # Stored in the same 4-tuple shape the DB-backed path has always used,
+    # with the servers array joined -- so _parse_servers and the health
+    # check loop need no knowledge of where the config came from.
+    assert manager._configs["file_pool"] == (
+        "https",
+        "example.com",
+        "1.2.3.4,app.example.com",
+        "/",
+    )
+    assert "file_pool" in manager._backends
+
+    host_name, servers = await manager._parse_servers(manager._configs["file_pool"])
+    assert host_name == "example.com"
+    assert servers == ["https://1.2.3.4", "https://app.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_file_and_db_backends_coexist(monkeypatch):
+    monkeypatch.setattr("classes.backend_manager.broadcast_config_update", AsyncMock())
+    manager = BackendManager(
+        db=DuplicateNameDb([_config_row(1, "db_pool", "9.9.9.9", "2026-07-18 11:00:00")]),
+        config_file=FakeConfigFile([_file_backend()]),
+    )
+
+    await manager._poll_configs_once()
+
+    assert set(manager._configs) == {"file_pool", "db_pool"}
+    assert manager.file_backend_names() == frozenset({"file_pool"})
+
+
+@pytest.mark.asyncio
+async def test_db_row_cannot_take_over_a_file_owned_name(monkeypatch):
+    """One name, one owner -- the same rule routes already follow."""
+    monkeypatch.setattr("classes.backend_manager.broadcast_config_update", AsyncMock())
+    manager = BackendManager(
+        db=DuplicateNameDb([_config_row(1, "file_pool", "9.9.9.9", "2026-07-18 11:00:00")]),
+        config_file=FakeConfigFile([_file_backend()]),
+    )
+
+    await manager._poll_configs_once()
+
+    # The file's definition stands; the colliding DB row is ignored.
+    assert manager._configs["file_pool"][2] == "1.2.3.4,app.example.com"
+
+
+@pytest.mark.asyncio
+async def test_validate_new_name_rejects_names_either_source_owns(monkeypatch):
+    monkeypatch.setattr("classes.backend_manager.broadcast_config_update", AsyncMock())
+    manager = BackendManager(
+        db=DuplicateNameDb([_config_row(1, "db_pool", "9.9.9.9", "2026-07-18 11:00:00")]),
+        config_file=FakeConfigFile([_file_backend()]),
+    )
+    await manager._poll_configs_once()
+
+    with pytest.raises(ValueError, match="config file"):
+        manager.validate_new_name("file_pool")
+    with pytest.raises(ValueError):
+        manager.validate_new_name("db_pool")
+
+    manager.validate_new_name("brand_new")  # free -- no error
+
+
+@pytest.mark.asyncio
+async def test_file_reload_rejected_when_it_claims_a_db_owned_name(monkeypatch):
+    monkeypatch.setattr("classes.backend_manager.broadcast_config_update", AsyncMock())
+    config_file = FakeConfigFile([])
+    manager = BackendManager(
+        db=DuplicateNameDb([_config_row(1, "db_pool", "9.9.9.9", "2026-07-18 11:00:00")]),
+        config_file=config_file,
+    )
+    await manager._poll_configs_once()
+    assert "db_pool" in manager._configs
+
+    config_file.set_backends([_file_backend(name="db_pool")])
+    with pytest.raises(ValueError, match="collide"):
+        manager.reload_file()
+
+    # Previous (valid) file view keeps serving rather than half-applying.
+    assert manager.file_backend_names() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_removing_a_backend_from_the_file_drops_it(monkeypatch):
+    monkeypatch.setattr("classes.backend_manager.broadcast_config_update", AsyncMock())
+    config_file = FakeConfigFile([_file_backend()])
+    manager = BackendManager(db=DummyDb(), config_file=config_file)
+    await manager._poll_configs_once()
+    assert "file_pool" in manager._backends
+
+    config_file.set_backends([])
+    await manager._poll_configs_once()
+
+    assert "file_pool" not in manager._backends
+    assert "file_pool" not in manager._configs
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"proto": "https", "host": "h", "servers": ["1.2.3.4"]},  # no name
+        {"name": "b", "proto": "ftp", "host": "h", "servers": ["1.2.3.4"]},  # bad proto
+        {"name": "b", "proto": "https", "servers": ["1.2.3.4"]},  # no host
+        {"name": "b", "proto": "https", "host": "h"},  # no servers
+        {"name": "b", "proto": "https", "host": "h", "servers": []},  # empty servers
+        {"name": "b", "proto": "https", "host": "h", "servers": "1.2.3.4"},  # not a list
+        {"name": "b", "proto": "https", "host": "h", "servers": [""]},  # empty entry
+    ],
+)
+def test_validate_backend_fails_loud_on_invalid_entries(bad):
+    with pytest.raises(ValueError):
+        _validate_backend(bad)
+
+
+def test_validate_backend_rejects_duplicate_names_within_the_file():
+    with pytest.raises(ValueError, match="Duplicate"):
+        _backends_from_raw([_file_backend(), _file_backend()], "apython_lb.toml")
+
+
+def test_list_configs_tags_provenance_and_hides_shadowed_db_rows():
+    manager = BackendManager(db=DummyDb(), config_file=FakeConfigFile([_file_backend()]))
+    manager._file_configs = {"file_pool": ("https", "example.com", "1.2.3.4", "/")}
+
+    items = manager.list_configs(
+        [
+            {
+                "id": 1,
+                "name": "db_pool",
+                "data": ["http", "h", "9.9.9.9", "/"],
+                "last_selected": "x",
+            },
+            {
+                "id": 2,
+                "name": "file_pool",
+                "data": ["http", "h", "8.8.8.8", "/"],
+                "last_selected": "y",
+            },
+        ]
+    )
+
+    by_name = {item["name"]: item for item in items}
+    assert by_name["file_pool"]["source"] == "file"
+    assert by_name["file_pool"]["id"] is None  # not a database row
+    assert by_name["db_pool"]["source"] == "db"
+    # The shadowed DB row isn't rendered twice under the same name.
+    assert len(items) == 2
